@@ -1,0 +1,3 @@
+# Links to a Pi Pocket checkout, for the type checker, the linter, and the tests.
+node_modules
+_pocket.d.ts
