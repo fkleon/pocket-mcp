@@ -60,9 +60,9 @@ const notes = (env: Record<string, string> = {}) => ({
     env: { NOTES_FILE: notesFile, PID_FILE: pidFile, ...env },
 });
 
-/** A route of the module, as the owner. */
-async function route(path: string, body?: object) {
-    const response = await fetch(`${base}/api/x/mcp/${path}`, {
+/** A request to a route of the module, as the owner. */
+const request = (path: string, body?: object) =>
+    fetch(`${base}/api/x/mcp/${path}`, {
         method: body === undefined ? "GET" : "POST",
         headers: {
             authorization: `Bearer ${app.config.ownerToken}`,
@@ -72,10 +72,22 @@ async function route(path: string, body?: object) {
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
 
+/** A route's answer, which must be a success. */
+async function route(path: string, body?: object) {
+    const response = await request(path, body);
+
     assert.equal(response.status, 200, await response.clone().text());
 
     return response.json();
 }
+
+/** A server as the owner's page has it. */
+const shown = async (name: string) =>
+    (await route("state")).servers.find((each: { name: string }) => each.name === name);
+
+/** Turn a server on, as the owner does from the page: for the entry that the page shows. */
+const turnOn = async (name: string) =>
+    route(`servers/${name}/on`, { on: true, fingerprint: (await shown(name)).fingerprint });
 
 /** Have Pi make one call, and give what the tool returned. */
 async function ask(name: string, args: Record<string, unknown>): Promise<string> {
@@ -119,23 +131,33 @@ after(async () => {
 test("a server runs only as the owner turned it on, and not after its entry changes", async () => {
     await until(async () => (await route("state")).servers.length === 1, "mcp.json read");
 
-    assert.match(
-        await mcpCall("notes", "add_note", { text: "one" }),
-        /No MCP server .notes. is on/,
-    );
+    await mcpCall("notes", "add_note", { text: "one" });
     assert.equal(existsSync(notesFile), false, "the server never ran");
 
-    await route("servers/notes/on", { on: true });
-    assert.match(await mcpCall("notes", "add_note", { text: "one" }), /Added: one/);
+    const seen = (await shown("notes")).fingerprint;
 
-    // Pi could change mcp.json with a shell: the changed entry stays off until the owner turns it on again.
+    await turnOn("notes");
+    await mcpCall("notes", "add_note", { text: "one" });
+    assert.equal(readFileSync(notesFile, "utf8"), "one\n");
+
+    // Pi could change mcp.json with a shell: the changed entry stays off until the owner turns it on again, and a
+    // page that still shows the old entry cannot turn on the new one.
     writeConfig({ notes: notes({ EXTRA: "1" }) });
+    await route("reload", {});
+    assert.equal((await request("servers/notes/on", { on: true, fingerprint: seen })).status, 409);
 
-    const { servers } = await route("reload", {});
+    const changed = await shown("notes");
 
-    assert.equal(servers[0].pocket, "changed");
-    assert.equal(servers[0].status, "off");
-    assert.match(await mcpCall("notes", "list_notes"), /No MCP server .notes. is on/);
+    assert.equal(changed.pocket, "changed");
+    assert.equal(changed.status, "off");
+    assert.deepEqual(
+        changed.parts
+            .filter((part: { changed: boolean }) => part.changed)
+            .map((part: { key: string }) => part.key),
+        ["env.EXTRA"],
+    );
+    await mcpCall("notes", "add_note", { text: "two" });
+    assert.equal(readFileSync(notesFile, "utf8"), "one\n");
 });
 
 test("what reaches Pi from a server is fenced, and holds none of its secrets", async () => {
@@ -145,8 +167,8 @@ test("what reaches Pi from a server is fenced, and holds none of its secrets", a
         broken: { ...notes(), env: { FAIL_EARLY: "${POCKET_MCP_TEST_SECRET}" } },
     });
     await route("reload", {});
-    await route("servers/notes/on", { on: true });
-    await route("servers/broken/on", { on: true });
+    await turnOn("notes");
+    await turnOn("broken");
 
     const injected = await mcpCall("notes", "inject");
 
@@ -168,18 +190,16 @@ test("what reaches Pi from a server is fenced, and holds none of its secrets", a
 test("plan mode runs only the read-only tools of servers that the owner trusts", async () => {
     await app.commands.setPlan(session, owner(app), true);
 
-    assert.match(await mcpCall("notes", "list_notes"), /Plan mode is on/);
+    await mcpCall("notes", "add_note", { text: "two" });
     assert.match(
         await mcpCall("notes", "list_notes", {}, "mcp_call_read_only"),
-        /runs only tools that the server marks read-only/,
+        /mcp_call_read_only runs only/,
     );
 
     await route("servers/notes/plan-mode", { on: true });
     assert.match(await mcpCall("notes", "list_notes", {}, "mcp_call_read_only"), /one/);
-    assert.match(
-        await mcpCall("notes", "add_note", { text: "two" }, "mcp_call_read_only"),
-        /runs only tools that the server marks read-only/,
-    );
+    await mcpCall("notes", "add_note", { text: "two" }, "mcp_call_read_only");
+    assert.equal(readFileSync(notesFile, "utf8"), "one\n", "plan mode changed nothing");
     await app.commands.setPlan(session, owner(app), false);
 });
 

@@ -1,6 +1,6 @@
-// The MCP module's browser part, for the owner: a page with the servers of mcp.json, their state and tools, and what
-// the owner can do with each (turn it on or off here, reconnect, sign in, allow plan mode), and how calls of the
-// module's tools show. Text from the servers (tool names, descriptions, errors) shows as text only.
+// The MCP module's browser part, for the owner: a page with the servers of mcp.json, their entries, state, and tools,
+// and what the owner can do with each (turn it on or off here, reconnect, sign in, allow plan mode); and how calls of
+// the module's tools show. Text from the servers (tool names, descriptions, errors) shows as text only.
 export const pocketApi = 1;
 
 /** A plug, as a 24×24 stroked path like the app's own icons. */
@@ -19,7 +19,7 @@ const STATUS = {
 const text = (value) => (typeof value === "string" ? value : "");
 
 export default function setup(pocket) {
-    const { html, useEffect, useState, useCallback, Loader, Switch } = pocket;
+    const { html, useEffect, useRef, useState, useCallback, Loader, Switch } = pocket;
 
     pocket.style("style.css");
 
@@ -35,35 +35,123 @@ export default function setup(pocket) {
         return state;
     };
 
-    /** One server: its switch, its state, what to do, and its tools. */
-    function ServerCard({ server, act, busy }) {
-        const run = (path, body) => act(path, body).catch(() => undefined);
+    /** The entry as mcp.json has it, with what changed since the owner turned it on. */
+    function Entry({ server }) {
+        const changed = server.parts.filter((part) => part.changed);
+
+        return html`<details class="mcp-entry" open=${server.pocket === "changed"}>
+            <summary class="small">
+                Entry in mcp.json${changed.length > 0 ? ` · changed: ${changed.map((part) => part.key).join(", ")}` : ""}
+            </summary>
+            <p class="small muted">
+                A literal value of env, headers, or oauth.clientSecret shows only its length: see
+                mcp.json.
+            </p>
+            <dl class="mono small">
+                ${server.parts.map(
+                    (part) =>
+                        html`<div class=${part.changed ? "mcp-changed" : ""}>
+                            <dt>${part.key}</dt>
+                            <dd>${part.text}</dd>
+                        </div>`,
+                )}
+            </dl>
+        </details>`;
+    }
+
+    /** A sign-in that waits: the link to its page, and the box for the address it ends on. */
+    function SignIn({ server, act, busy }) {
         const [address, setAddress] = useState("");
-        const [pasteError, setPasteError] = useState(null);
+        const [error, setError] = useState(null);
+        const path = `servers/${encodeURIComponent(server.name)}/sign-in`;
+
+        const paste = async () => {
+            setError(null);
+
+            try {
+                await act(`${path}/paste`, { address }, { quiet: true });
+            } catch (failure) {
+                setError(failure.message);
+            }
+        };
+
+        return html`<div class="mcp-signin">
+            <a class="button primary" href=${server.signIn} target="_blank" rel="noopener noreferrer">
+                Open the sign-in page
+            </a>
+            <p class="small muted">
+                The sign-in ends on a page of the machine that runs Pi Pocket (127.0.0.1). When that
+                page does not load, for example on a phone, copy its address and paste it here.
+            </p>
+            <div class="mcp-row">
+                <input
+                    class="mcp-input"
+                    type="url"
+                    aria-label="The address that the sign-in ended on"
+                    placeholder="http://127.0.0.1:…/callback?code=…"
+                    value=${address}
+                    onInput=${(event) => setAddress(event.currentTarget.value)}
+                />
+                <button class="button" disabled=${busy || !address} onClick=${paste}>Finish</button>
+                <button
+                    class="button"
+                    disabled=${busy}
+                    onClick=${() => act(`${path}/cancel`, {}).catch(() => undefined)}
+                >
+                    Cancel
+                </button>
+            </div>
+            ${error ? html`<div class="error-box">${error}</div>` : null}
+        </div>`;
+    }
+
+    /** The tools that the server lists, with the ones that Pi does not get. */
+    function Tools({ server }) {
+        const visible = server.tools.filter((tool) => !tool.hidden).length;
+        const hidden = server.tools.length - visible;
+
+        return html`<details class="mcp-tools">
+            <summary class="small">
+                ${visible} ${visible === 1 ? "tool" : "tools"} for
+                Pi${hidden > 0 ? `, ${hidden} hidden` : ""}
+            </summary>
+            <ul>
+                ${server.tools.map(
+                    (tool) =>
+                        html`<li class=${tool.hidden ? "mcp-hidden" : ""}>
+                            <div>
+                                <span class="mono small">${tool.name}</span>
+                                ${tool.readOnly ? html`<span class="mcp-tag">read-only</span>` : null}
+                                ${tool.hidden ? html`<span class="mcp-tag">hidden</span>` : null}
+                            </div>
+                            ${
+                                tool.title || tool.description
+                                    ? html`<div class="small muted mcp-about">
+                                      ${[tool.title, tool.description].filter(Boolean).join(" — ")}
+                                  </div>`
+                                    : null
+                            }
+                        </li>`,
+                )}
+            </ul>
+        </details>`;
+    }
+
+    /** One server: its switch, its entry, its state, what to do, and its tools. */
+    function ServerCard({ server, act, busy }) {
+        const path = `servers/${encodeURIComponent(server.name)}`;
+        const run = (to, body) => act(`${path}/${to}`, body).catch(() => undefined);
         const [label, kind] = STATUS[server.status] ?? [server.status, ""];
         const live = server.pocket === "on" && server.enabledInFile && !server.unsupported;
         const canTurnOn = server.enabledInFile && !server.unsupported;
-        const visible = server.tools.filter((tool) => !tool.hidden).length;
-
-        const paste = async () => {
-            setPasteError(null);
-
-            try {
-                await act(`servers/${encodeURIComponent(server.name)}/sign-in/paste`, {
-                    address,
-                });
-                setAddress("");
-            } catch (failure) {
-                setPasteError(failure.message);
-            }
-        };
+        const pill = live ? label : server.pocket === "changed" ? "Changed" : "Off";
 
         return html`<section class="mcp-server">
             <div class="mcp-head">
                 <div class="mcp-title">
                     <strong class="mcp-name">${server.name}</strong>
-                    <span class=${`mcp-pill ${live ? kind : ""}`}>
-                        ${live ? label : server.pocket === "changed" ? "Changed" : "Off"}
+                    <span class=${`mcp-pill ${live ? kind : server.pocket === "changed" ? "warn" : ""}`}>
+                        ${pill}
                     </span>
                 </div>
                 <${Switch}
@@ -71,17 +159,14 @@ export default function setup(pocket) {
                     label=${`Run ${server.name} in Pi Pocket`}
                     disabled=${busy || (!canTurnOn && server.pocket !== "on")}
                     onChange=${() =>
-                        run(`servers/${encodeURIComponent(server.name)}/on`, {
+                        run("on", {
                             on: server.pocket !== "on",
+                            fingerprint: server.fingerprint,
                         })}
                 />
             </div>
             <div class="mono small mcp-target">${server.kind} · ${server.target}</div>
-            ${
-                server.description
-                    ? html`<div class="small muted">${server.description}</div>`
-                    : null
-            }
+            ${server.description ? html`<div class="small muted">${server.description}</div>` : null}
             ${
                 server.unsupported
                     ? html`<div class="small mcp-warn">Pi Pocket cannot run it: ${server.unsupported}.</div>`
@@ -95,66 +180,22 @@ export default function setup(pocket) {
             ${
                 server.pocket === "changed" && server.enabledInFile
                     ? html`<div class="small mcp-warn">
-                      Its entry in mcp.json changed after you turned it on. Check the entry, then turn
-                      it on again.
+                      Its entry in mcp.json changed after you turned it on. Look at what changed, then
+                      turn it on again.
                   </div>`
                     : null
             }
-            ${
-                live && server.error
-                    ? html`<pre class="mono small mcp-error">${server.error}</pre>`
-                    : null
-            }
+            <${Entry} server=${server} />
+            ${live && server.error ? html`<pre class="mono small mcp-error">${server.error}</pre>` : null}
             ${
                 server.signIn
-                    ? html`<div class="mcp-signin">
-                      <a
-                          class="button primary"
-                          href=${server.signIn}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                      >
-                          Open the sign-in page
-                      </a>
-                      <p class="small muted">
-                          The sign-in ends on a page of this machine (127.0.0.1). When that page does
-                          not load, for example on a phone, copy its address and paste it here.
-                      </p>
-                      <div class="mcp-row">
-                          <input
-                              class="mcp-input"
-                              type="url"
-                              placeholder="http://127.0.0.1:…/callback?code=…"
-                              value=${address}
-                              onInput=${(event) => setAddress(event.currentTarget.value)}
-                          />
-                          <button class="button" disabled=${busy || !address} onClick=${paste}>
-                              Finish
-                          </button>
-                          <button
-                              class="button"
-                              disabled=${busy}
-                              onClick=${() =>
-                                  run(
-                                      `servers/${encodeURIComponent(server.name)}/sign-in/cancel`,
-                                      {},
-                                  )}
-                          >
-                              Cancel
-                          </button>
-                      </div>
-                      ${pasteError ? html`<div class="error-box">${pasteError}</div>` : null}
-                  </div>`
+                    ? html`<${SignIn} key=${server.signIn} server=${server} act=${act} busy=${busy} />`
                     : null
             }
             ${
                 live
                     ? html`<div class="mcp-row">
-                      <button
-                          class="button"
-                          disabled=${busy}
-                          onClick=${() => run(`servers/${encodeURIComponent(server.name)}/reconnect`, {})}
-                      >
+                      <button class="button" disabled=${busy} onClick=${() => run("reconnect", {})}>
                           Reconnect
                       </button>
                       ${
@@ -162,8 +203,7 @@ export default function setup(pocket) {
                               ? html`<button
                                 class=${`button ${server.status === "needs-sign-in" ? "primary" : ""}`}
                                 disabled=${busy}
-                                onClick=${() =>
-                                    run(`servers/${encodeURIComponent(server.name)}/sign-in`, {})}
+                                onClick=${() => run("sign-in", {})}
                             >
                                 Sign in
                             </button>`
@@ -174,8 +214,7 @@ export default function setup(pocket) {
                               ? html`<button
                                 class="button"
                                 disabled=${busy}
-                                onClick=${() =>
-                                    run(`servers/${encodeURIComponent(server.name)}/sign-out`, {})}
+                                onClick=${() => run("sign-out", {})}
                             >
                                 Sign out
                             </button>`
@@ -192,54 +231,10 @@ export default function setup(pocket) {
                     on=${server.planMode}
                     label=${`Plan mode may run read-only tools of ${server.name}`}
                     disabled=${busy}
-                    onChange=${() =>
-                        run(`servers/${encodeURIComponent(server.name)}/plan-mode`, {
-                            on: !server.planMode,
-                        })}
+                    onChange=${() => run("plan-mode", { on: !server.planMode })}
                 />
             </div>
-            ${
-                server.tools.length > 0
-                    ? html`<details class="mcp-tools">
-                      <summary class="small">
-                          ${visible} ${visible === 1 ? "tool" : "tools"} for Pi${
-                              visible < server.tools.length
-                                  ? `, ${server.tools.length - visible} hidden`
-                                  : ""
-                          }
-                      </summary>
-                      <ul>
-                          ${server.tools.map(
-                              (tool) =>
-                                  html`<li class=${tool.hidden ? "mcp-hidden" : ""}>
-                                      <div>
-                                          <span class="mono small">${tool.name}</span>
-                                          ${
-                                              tool.readOnly
-                                                  ? html`<span class="mcp-tag">read-only</span>`
-                                                  : null
-                                          }
-                                          ${
-                                              tool.hidden
-                                                  ? html`<span class="mcp-tag">hidden</span>`
-                                                  : null
-                                          }
-                                      </div>
-                                      ${
-                                          tool.title || tool.description
-                                              ? html`<div class="small muted mcp-about">
-                                                ${[tool.title, tool.description]
-                                                    .filter(Boolean)
-                                                    .join(" — ")}
-                                            </div>`
-                                              : null
-                                      }
-                                  </li>`,
-                          )}
-                      </ul>
-                  </details>`
-                    : null
-            }
+            ${server.tools.length > 0 ? html`<${Tools} server=${server} />` : null}
         </section>`;
     }
 
@@ -248,41 +243,56 @@ export default function setup(pocket) {
         const [state, setState] = useState(null);
         const [error, setError] = useState(null);
         const [busy, setBusy] = useState(false);
+        // Answers can come back out of order: only the newest request sets the state.
+        const latest = useRef(0);
+
+        const show = (request, answer) => {
+            if (request === latest.current) {
+                rail.update({ badge: answer.attention });
+                setState(answer);
+            }
+        };
 
         const refresh = useCallback(async () => {
+            const request = ++latest.current;
+
             try {
-                setState(await read());
+                show(request, await pocket.api("state"));
                 setError(null);
             } catch (failure) {
                 setError(failure.message);
             }
         }, []);
 
-        /** Do one thing on the server, then show the new state. A sign-in opens its page from a link. */
-        const act = useCallback(async (path, body) => {
+        /**
+         * Do one thing on the server, then show the new state. A sign-in opens its page from a link. With `quiet`, the
+         * caller shows the error.
+         */
+        const act = useCallback(async (path, body, { quiet = false } = {}) => {
             setBusy(true);
+
+            const request = ++latest.current;
 
             try {
                 const answer = await pocket.api(path, body);
 
                 if (answer && Array.isArray(answer.servers)) {
-                    rail.update({ badge: answer.attention });
-                    setState(answer);
+                    show(request, answer);
                 } else {
                     await refresh();
                 }
 
                 setError(null);
             } catch (failure) {
-                setError(failure.message);
+                if (!quiet) {
+                    setError(failure.message);
+                }
 
                 throw failure;
             } finally {
                 setBusy(false);
             }
         }, []);
-
-        const quietly = (path, body) => act(path, body).catch(() => undefined);
 
         useEffect(() => {
             void refresh();
@@ -300,12 +310,16 @@ export default function setup(pocket) {
         return html`<div class="mcp-page">
             <p class="small muted">
                 The servers of <span class="mono">${state.file}</span>, which Pi's terminal app uses
-                too. Each server is a program that runs with your rights. Pi Pocket starts a server only
-                after you turn it on here, and again after each change to its entry. Lancet Guard does
-                not check the calls of MCP tools.
+                too. Each server is a program that runs with your rights, and Lancet Guard does not
+                check the calls of its tools. Pi Pocket starts a server only after you turn it on here,
+                and again after each change to its entry.
             </p>
             <div class="mcp-row">
-                <button class="button" disabled=${busy} onClick=${() => quietly("reload", {})}>
+                <button
+                    class="button"
+                    disabled=${busy}
+                    onClick=${() => act("reload", {}).catch(() => undefined)}
+                >
                     Read mcp.json again
                 </button>
             </div>
@@ -356,8 +370,7 @@ export default function setup(pocket) {
     pocket.onDispose(() => window.removeEventListener("pageshow", recount));
     recount();
 
-    const where = (args) => [text(args.server), text(args.tool)].filter(Boolean).join(" · ");
-
+    // How calls show in transcripts, in the owner's tabs (the browser module is the owner's only).
     pocket.toolCall({
         tool: "mcp_tools",
         iconPath: PLUG,
@@ -371,7 +384,7 @@ export default function setup(pocket) {
             tool,
             iconPath: PLUG,
             label: () => "call MCP tool",
-            subject: where,
+            subject: (args) => [text(args.server), text(args.tool)].filter(Boolean).join(" · "),
             summary: () => ({ verb: "called", noun: "MCP tool", by: "tool" }),
         });
     }

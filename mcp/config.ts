@@ -7,7 +7,7 @@
  * it on again.
  */
 import { exec } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -51,11 +51,20 @@ export interface HttpConfig extends CommonConfig {
 
 export type ServerConfig = StdioConfig | HttpConfig;
 
+/** A part of an entry, as the owner's page shows it, with its own hash to tell what changed. */
+export interface EntryPart {
+    key: string;
+    text: string;
+    hash: string;
+}
+
 export interface ServerEntry {
     name: string;
     config: ServerConfig;
     /** SHA-256 of the entry without `enabled`: the owner's switch holds the one it turned on. */
     fingerprint: string;
+    /** Each part of the entry that the fingerprint covers. */
+    parts: EntryPart[];
     /** Why Pi Pocket cannot run this entry, when it uses something only Pi's terminal app has. */
     unsupported?: string;
 }
@@ -95,10 +104,76 @@ function canonical(value: unknown): string {
     return JSON.stringify(value) ?? "null";
 }
 
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+
 export function fingerprintOf(raw: Record<string, unknown>): string {
     const { enabled: _enabled, ...rest } = raw;
 
-    return createHash("sha256").update(canonical(rest)).digest("hex");
+    return sha256(canonical(rest));
+}
+
+/**
+ * A value that can hold a secret, as the page shows it: a command (`!…`) and a value that names variables (`${…}`)
+ * show as they are, and a literal shows only its length.
+ */
+function masked(value: unknown): string {
+    if (typeof value !== "string") {
+        return canonical(value);
+    }
+
+    return value.startsWith("!") || /\$\{?[A-Za-z_]/.test(value)
+        ? value
+        : `(a literal value of ${value.length} characters)`;
+}
+
+/**
+ * The parts of an entry that the fingerprint covers, one for each field, and one for each variable of `env`, header
+ * of `headers`, and field of `oauth`. The owner's page shows them all, and which of them changed.
+ */
+export function partsOf(raw: Record<string, unknown>): EntryPart[] {
+    const parts: EntryPart[] = [];
+
+    for (const key of Object.keys(raw).sort()) {
+        const value = raw[key];
+
+        if (key === "enabled") {
+            continue;
+        }
+
+        if ((key === "env" || key === "headers" || key === "oauth") && isRecord(value)) {
+            for (const name of Object.keys(value).sort()) {
+                const secret = key !== "oauth" || name === "clientSecret";
+
+                parts.push({
+                    key: `${key}.${name}`,
+                    text: secret ? masked(value[name]) : canonical(value[name]),
+                    hash: sha256(canonical(value[name])),
+                });
+            }
+
+            if (Object.keys(value).length === 0) {
+                parts.push({ key, text: "{}", hash: sha256("{}") });
+            }
+
+            continue;
+        }
+
+        parts.push({ key, text: canonical(value), hash: sha256(canonical(value)) });
+    }
+
+    return parts;
+}
+
+/** The keys of the parts that are different from the hashes kept when the owner turned the server on. */
+export function changedParts(parts: EntryPart[], approved: Record<string, string>): string[] {
+    const now = new Map(parts.map((part) => [part.key, part.hash]));
+    const keys = new Set([...now.keys(), ...Object.keys(approved)]);
+
+    return [...keys]
+        .filter(
+            (key) => now.get(key) !== (Object.hasOwn(approved, key) ? approved[key] : undefined),
+        )
+        .sort();
 }
 
 function exposureError(value: unknown): boolean {
@@ -122,6 +197,10 @@ function oauthError(value: unknown): string | undefined {
         }
     }
 
+    if (value.clientName !== undefined && !(value.clientName as string).trim()) {
+        return "oauth.clientName must not be empty";
+    }
+
     const port = value.callbackPort;
 
     if (
@@ -136,6 +215,10 @@ function oauthError(value: unknown): string | undefined {
 
         if (url?.protocol !== "http:" || !LOOPBACK.has(url.hostname) || url.search || url.hash) {
             return "oauth.callbackUrl must be an http address on localhost, 127.0.0.1, or [::1]";
+        }
+
+        if (url.port && port !== undefined && Number(url.port) !== port) {
+            return "oauth.callbackUrl and oauth.callbackPort name different ports";
         }
     }
 
@@ -323,6 +406,7 @@ export async function loadConfig(agentDir: string): Promise<LoadedConfig> {
             name,
             config,
             fingerprint: fingerprintOf(raw as Record<string, unknown>),
+            parts: partsOf(raw as Record<string, unknown>),
             ...(why === undefined ? {} : { unsupported: why }),
         });
     }
@@ -439,13 +523,18 @@ export function toolExposure(config: ServerConfig, tool: string): Exposure {
 }
 
 /**
- * A JSON file of the module's own, in a folder that only the owner's user can open. Writes go one at a time and
- * replace the file in one step. Each write reads the file again, so two versions of the module (an edit loads the
- * new one before the old one goes) lose nothing of each other's.
+ * The writes to each file, in order. Pi Pocket loads this helper once for all versions of the module, so the old and
+ * the new version share these queues while an edit replaces one with the other.
+ */
+const queues = new Map<string, Promise<unknown>>();
+
+/**
+ * A JSON file of the module's own, in a folder that only the owner's user can open. Writes go one at a time, read the
+ * file again, and replace it in one step. A file that is not there reads as empty; one that cannot be read is an
+ * error, so that a write never replaces it with nothing.
  */
 export class JsonStore<T extends object> {
     readonly file: string;
-    #queue: Promise<unknown> = Promise.resolve();
     readonly #empty: () => T;
 
     constructor(file: string, empty: () => T) {
@@ -454,30 +543,44 @@ export class JsonStore<T extends object> {
     }
 
     async read(): Promise<T> {
-        try {
-            const parsed: unknown = JSON.parse(await readFile(this.file, "utf8"));
+        let text: string;
 
-            return isRecord(parsed) ? (parsed as T) : this.#empty();
-        } catch {
-            return this.#empty();
+        try {
+            text = await readFile(this.file, "utf8");
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+                return this.#empty();
+            }
+
+            throw error;
         }
+
+        const parsed: unknown = JSON.parse(text);
+
+        if (!isRecord(parsed)) {
+            throw new Error(`${this.file} does not hold a JSON object`);
+        }
+
+        return parsed as T;
     }
 
     update<R>(change: (value: T) => R): Promise<R> {
-        const run = this.#queue.then(async () => {
+        const run = (queues.get(this.file) ?? Promise.resolve()).then(async () => {
             const value = await this.read();
             const result = change(value);
-            const folder = dirname(this.file);
-            const temporary = `${this.file}.${process.pid}.tmp`;
+            const temporary = `${this.file}.${randomUUID()}.tmp`;
 
-            await mkdir(folder, { recursive: true, mode: 0o700 });
+            await mkdir(dirname(this.file), { recursive: true, mode: 0o700 });
             await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
             await rename(temporary, this.file);
 
             return result;
         });
 
-        this.#queue = run.catch(() => undefined);
+        queues.set(
+            this.file,
+            run.catch(() => undefined),
+        );
 
         return run;
     }
@@ -486,6 +589,8 @@ export class JsonStore<T extends object> {
 export interface ServerSettings {
     /** The fingerprint of the entry that the owner turned on in Pi Pocket. */
     approved?: string;
+    /** The hash of each part of that entry, to show what changed since. */
+    parts?: Record<string, string>;
     /** Plan mode may run the tools that this server marks read-only. */
     planMode?: boolean;
 }

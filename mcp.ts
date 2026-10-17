@@ -1,10 +1,13 @@
 /**
  * MCP servers for Pi: Pi Pocket connects to the stdio and HTTP servers in Pi's own mcp.json, and Pi finds and calls
  * their tools with mcp_tools, mcp_call, and mcp_call_read_only. Each server is a program that runs with the owner's
- * rights. It reads ~/.pi/agent/mcp.json and the environment variables and commands that it names, starts the stdio
- * servers in it, and contacts the HTTP servers in it and their sign-in servers. A server runs only after the owner
- * turns it on in the MCP page (owner only), and again after each change to its entry. It keeps its settings and OAuth
- * tokens in the mcp folder of the data folder.
+ * rights, and Lancet Guard does not check the calls of its tools. A server runs only after the owner turns it on in the
+ * MCP page, and again after each change to its entry. The module reads ~/.pi/agent/mcp.json and the variables and
+ * commands that its entries name, and keeps its settings and OAuth tokens in ~/.pi-pocket/mcp/.
+ *
+ * It starts the stdio servers that the owner turned on, and contacts the HTTP servers that the owner turned on, and
+ * their authorization servers to sign in and to refresh tokens. During a sign-in, it listens on a loopback address for
+ * the redirect. It never changes mcp.json.
  */
 import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool, section } from "@earendil-works/pi-durable";
@@ -20,6 +23,7 @@ import {
 } from "@earendil-works/pi-mcp";
 import type { Host, Web } from "./_pocket.d.ts";
 import {
+    changedParts,
     type LoadedConfig,
     loadConfig,
     type ServerEntry,
@@ -36,11 +40,18 @@ export const pocketApi = 1;
 const VERSION = "0.1.0";
 /** How long mcp_tools waits for servers that still connect. */
 const LIST_WAIT_MS = 10_000;
+/** A server that fails as the module starts gets one more try this much later: the version before may still hold it. */
+const START_RETRY_MS = 3_000;
 /** The text of one result, and of one list of tools, that goes to the model at most. */
 const MAX_RESULT_CHARS = 40_000;
 const MAX_LIST_CHARS = 40_000;
 const MAX_SCHEMA_CHARS = 2_000;
-const MAX_IMAGE_CHARS = 4_000_000;
+/** The images of one result that go to the model at most: their number, and their base64 characters together. */
+const MAX_IMAGES = 4;
+const MAX_IMAGE_CHARS = 8_000_000;
+/** Image types that every model provider takes. */
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 /** Tool names that Pi gets to see: what the MCP specification asks of a name. Other tools are left out. */
 const TOOL_NAME = /^[A-Za-z0-9_.:/-]{1,128}$/;
 
@@ -51,9 +62,13 @@ const NOTE =
 interface ServerView {
     name: string;
     kind: "stdio" | "http";
-    /** The command and its arguments, or the address without its query. Never `env` or `headers`. */
+    /** The command and its arguments, or the address without its query. */
     target: string;
     description?: string;
+    /** The fingerprint of the entry as the page shows it: the switch turns on only this entry. */
+    fingerprint: string;
+    /** Each part of the entry (literal values of `env`, `headers`, and secrets masked), and whether it changed. */
+    parts: { key: string; text: string; changed: boolean }[];
     /** `enabled` in mcp.json. */
     enabledInFile: boolean;
     /** The owner's switch here: on, off, or on for an entry that changed since. */
@@ -92,15 +107,20 @@ function target(entry: ServerEntry): string {
     return [config.command, ...(config.args ?? [])].join(" ");
 }
 
+/** Text from a server, when it is text: the client checks only a tool's name and schema. */
+const text = (value: unknown): string | undefined =>
+    typeof value === "string" ? value : undefined;
+const titleOf = (tool: Tool) => text(tool.title) ?? text(tool.annotations?.title);
+
 /** Text cut in the middle, with a note of how much went. */
-function cut(text: string, max: number): string {
-    if (text.length <= max) {
-        return text;
+function cut(value: string, max: number): string {
+    if (value.length <= max) {
+        return value;
     }
 
     const half = Math.floor(max / 2);
 
-    return `${text.slice(0, half)}\n…${text.length - 2 * half} characters left out…\n${text.slice(-half)}`;
+    return `${value.slice(0, half)}\n…${value.length - 2 * half} characters left out…\n${value.slice(-half)}`;
 }
 
 class Servers {
@@ -113,7 +133,10 @@ class Servers {
     readonly #settings;
     readonly #oauth;
     #closed = false;
+    #started = false;
     #notify: NodeJS.Timeout | undefined;
+    #loading: Promise<unknown> = Promise.resolve();
+    readonly #calls = new Set<Promise<unknown>>();
 
     constructor(host: Host, web: Web) {
         this.#host = host;
@@ -134,12 +157,27 @@ class Servers {
         );
     }
 
-    /** Read mcp.json and the settings again, and start, keep, or stop each server to match. */
-    async load(): Promise<void> {
-        const [config, settings] = await Promise.all([
-            loadConfig(this.#host.agentDir),
-            this.#settings.read(),
-        ]);
+    /** Read mcp.json and the settings again, and start, keep, or stop each server to match. One load at a time. */
+    load(): Promise<void> {
+        const run = this.#loading.then(() => this.#load());
+
+        this.#loading = run.catch(() => undefined);
+
+        return run;
+    }
+
+    async #load(): Promise<void> {
+        const config = await loadConfig(this.#host.agentDir);
+
+        let settings: Settings;
+
+        try {
+            settings = await this.#settings.read();
+        } catch (error) {
+            // Without its settings, no server is on.
+            settings = { servers: {} };
+            config.errors.push(`${this.#settings.file}: ${(error as Error).message}`);
+        }
 
         if (this.#closed) {
             return;
@@ -160,59 +198,90 @@ class Servers {
             }
         }
 
-        for (const [name, entry] of wanted) {
-            if (!this.live.has(name)) {
-                const server = new Server(entry, {
-                    version: VERSION,
-                    oauth: this.#oauth,
-                    onChange: () => this.changed(),
-                });
+        this.changed();
+        // The old copy of a changed server goes before the new one starts.
+        await Promise.all(stopping);
 
-                this.live.set(name, server);
-                // Its failure shows on the page; the next call tries again.
-                server.client().catch(() => undefined);
+        if (this.#closed) {
+            return;
+        }
+
+        const first = !this.#started;
+
+        this.#started = true;
+
+        for (const [name, entry] of wanted) {
+            if (this.live.has(name)) {
+                continue;
             }
+
+            const server = new Server(entry, {
+                version: VERSION,
+                oauth: this.#oauth,
+                onChange: () => this.changed(),
+            });
+
+            this.live.set(name, server);
+            // A failure shows on the page, and the next call tries again. As the module starts, the version before
+            // may still run the same server, so it gets one more try soon.
+            server.client().catch(() => {
+                if (first) {
+                    setTimeout(
+                        () => void server.client().catch(() => undefined),
+                        START_RETRY_MS,
+                    ).unref();
+                }
+            });
         }
 
         this.changed();
-        await Promise.all(stopping);
     }
 
     entry(name: string): ServerEntry | undefined {
         return this.config.servers.find((entry) => entry.name === name);
     }
 
-    /** Turn a server on or off here. On holds the entry as it is now. */
-    async setOn(name: string, on: boolean): Promise<void> {
+    /**
+     * Turn a server on or off here. On holds the entry that the owner's page showed (`seen`, its fingerprint): false
+     * when mcp.json changed since. Plan mode's trust was for the entry as it was, so a changed entry loses it.
+     */
+    async setOn(name: string, on: boolean, seen: unknown): Promise<boolean> {
+        await this.load();
+
         const entry = this.entry(name);
 
-        if (entry === undefined) {
-            return;
+        if (entry === undefined || (on && seen !== entry.fingerprint)) {
+            return false;
         }
 
         await this.#settings.update((settings) => {
-            const servers = settings.servers ?? {};
             const current = serverSettings(settings, name);
+            const kept =
+                current.planMode === true &&
+                (current.approved === undefined || current.approved === entry.fingerprint);
+            const next: ServerSettings = on
+                ? {
+                      approved: entry.fingerprint,
+                      parts: Object.fromEntries(entry.parts.map((part) => [part.key, part.hash])),
+                      planMode: kept,
+                  }
+                : { planMode: current.planMode === true };
 
-            settings.servers = {
-                ...servers,
-                [name]: { ...current, approved: on ? entry.fingerprint : undefined },
-            };
+            settings.servers = { ...settings.servers, [name]: next };
         });
         await this.load();
+
+        return true;
     }
 
     async setPlanMode(name: string, on: boolean): Promise<void> {
         await this.#settings.update((settings) => {
-            const servers = settings.servers ?? {};
-
             settings.servers = {
-                ...servers,
+                ...settings.servers,
                 [name]: { ...serverSettings(settings, name), planMode: on },
             };
         });
-        this.settings = await this.#settings.read();
-        this.changed();
+        await this.load();
     }
 
     /** Whether plan mode may run the tool: the server marks it read-only, and the owner trusts that here. */
@@ -270,65 +339,103 @@ class Servers {
         return count;
     }
 
+    async #serverView(entry: ServerEntry): Promise<ServerView> {
+        const settings = serverSettings(this.settings, entry.name);
+        const server = this.live.get(entry.name);
+        const shown = server ? new Set(this.visible(server)) : new Set<Tool>();
+        const pocket =
+            settings.approved === undefined
+                ? "off"
+                : settings.approved === entry.fingerprint
+                  ? "on"
+                  : "changed";
+        const changed = pocket === "changed" ? changedParts(entry.parts, settings.parts ?? {}) : [];
+
+        return {
+            name: entry.name,
+            kind: "url" in entry.config ? "http" : "stdio",
+            target: target(entry),
+            ...(entry.config.description === undefined
+                ? {}
+                : { description: entry.config.description }),
+            fingerprint: entry.fingerprint,
+            parts: entry.parts.map(({ key, text }) => ({
+                key,
+                text,
+                changed: changed.includes(key),
+            })),
+            enabledInFile: entry.config.enabled !== false,
+            pocket,
+            ...(entry.unsupported === undefined ? {} : { unsupported: entry.unsupported }),
+            status: server?.status ?? "off",
+            ...(server?.error === undefined ? {} : { error: server.error }),
+            // A changed entry loses plan mode's trust when the owner turns it on again.
+            planMode: settings.planMode === true && pocket !== "changed",
+            oauth: server?.oauth ?? false,
+            signedIn: (await server?.signedIn()) ?? false,
+            ...(server?.signIn === undefined ? {} : { signIn: server.signIn.url }),
+            tools: (server?.tools ?? []).map((tool) => {
+                const title = titleOf(tool);
+                const description = text(tool.description);
+
+                return {
+                    name: tool.name,
+                    ...(title === undefined ? {} : { title: cut(title, 200) }),
+                    ...(description === undefined ? {} : { description: cut(description, 600) }),
+                    readOnly: tool.annotations?.readOnlyHint === true,
+                    hidden: !shown.has(tool),
+                };
+            }),
+        };
+    }
+
     async view(): Promise<{
         file: string;
         errors: string[];
         attention: number;
         servers: ServerView[];
     }> {
+        const errors = [...this.config.errors];
         const servers = await Promise.all(
-            this.config.servers.map(async (entry): Promise<ServerView> => {
-                const settings = serverSettings(this.settings, entry.name);
-                const server = this.live.get(entry.name);
-                const shown = server ? new Set(this.visible(server)) : new Set<Tool>();
+            this.config.servers.map((entry) =>
+                // One server that the page cannot show must not hide the others, and their switches.
+                this.#serverView(entry).catch((error: unknown) => {
+                    errors.push(`server "${entry.name}": ${(error as Error).message}`);
 
-                return {
-                    name: entry.name,
-                    kind: "url" in entry.config ? "http" : "stdio",
-                    target: target(entry),
-                    ...(entry.config.description === undefined
-                        ? {}
-                        : { description: entry.config.description }),
-                    enabledInFile: entry.config.enabled !== false,
-                    pocket:
-                        settings.approved === undefined
-                            ? "off"
-                            : settings.approved === entry.fingerprint
-                              ? "on"
-                              : "changed",
-                    ...(entry.unsupported === undefined ? {} : { unsupported: entry.unsupported }),
-                    status: server?.status ?? "off",
-                    ...(server?.error === undefined ? {} : { error: server.error }),
-                    planMode: settings.planMode === true,
-                    oauth: server?.oauth ?? false,
-                    signedIn: (await server?.signedIn()) ?? false,
-                    ...(server?.signIn === undefined ? {} : { signIn: server.signIn.url }),
-                    tools: (server?.tools ?? []).map((tool) => ({
-                        name: tool.name,
-                        ...((tool.title ?? tool.annotations?.title)
-                            ? { title: (tool.title ?? tool.annotations?.title)! }
-                            : {}),
-                        ...(tool.description === undefined
-                            ? {}
-                            : { description: cut(tool.description, 600) }),
-                        readOnly: tool.annotations?.readOnlyHint === true,
-                        hidden: !shown.has(tool),
-                    })),
-                };
-            }),
+                    return undefined;
+                }),
+            ),
         );
 
         return {
             file: this.config.file,
-            errors: this.config.errors,
+            errors,
             attention: this.attention(),
-            servers,
+            servers: servers.filter((each) => each !== undefined),
         };
     }
 
+    /** Count a call that runs, so that this version's cleanup waits for it. */
+    track<T>(call: Promise<T>): Promise<T> {
+        this.#calls.add(call);
+        call.then(
+            () => this.#calls.delete(call),
+            () => this.#calls.delete(call),
+        );
+
+        return call;
+    }
+
+    /**
+     * Stop each server, after the calls that run. After an edit, or when the owner turns the module off, a call that
+     * runs finishes with this version, as Pi Pocket expects. When Pi Pocket stops, it does not wait long for this: it
+     * stops with the call still running, and the call comes back to Pi as interrupted after the restart. Pi's MCP
+     * client then stops the stdio servers when the process exits.
+     */
     async close(): Promise<void> {
         this.#closed = true;
         clearTimeout(this.#notify);
+        await Promise.allSettled([...this.#calls]);
 
         const servers = [...this.live.values()];
 
@@ -339,21 +446,26 @@ class Servers {
 
 export default function createMcp(host: Host, web: Web) {
     const servers = new Servers(host, web);
-    const quote = (text: string, max?: number) => host.text.quoted(text, max);
+    const quote = (value: string, max?: number) => host.text.quoted(value, max);
 
     web.onDispose(() => servers.close());
 
     // Connect after the module has loaded, not while it loads. A version that does not install is cleaned up first.
     const start = setTimeout(() => {
         if (!servers.closed) {
-            void servers.load();
+            servers.load().catch((error: unknown) => {
+                host.notice(
+                    "error",
+                    `MCP: could not read the servers: ${(error as Error).message}`,
+                );
+            });
         }
     }, 0);
 
     web.onDispose(() => clearTimeout(start));
 
-    /** The live server that Pi names, or an error that Pi can act on. */
-    const liveServer = (name: string): Server => {
+    /** The server that Pi names, when it is on, or an error that Pi can act on. */
+    const serverFor = (name: string): Server => {
         const server = servers.live.get(name);
 
         if (server !== undefined) {
@@ -372,17 +484,41 @@ export default function createMcp(host: Host, web: Web) {
             ? `MCP server ${quote(server.name)} needs the owner to sign in, on the MCP page of Pi Pocket.`
             : `MCP server ${quote(server.name)} is not connected (${server.status}). The owner can see why, and reconnect it, on the MCP page of Pi Pocket.`;
 
-    /** A result for the model: the server's text between tags, and its images. */
+    /** A result for the model: the server's text between tags, and the images that every provider takes. */
     const result = (server: Server, tool: string, called: CallToolResult) => {
         const blocks = toLlmContent(called);
-        const text = blocks.flatMap((block) => (block.type === "text" ? [block.text] : []));
-        const images = blocks.flatMap((block) =>
-            block.type === "image" && block.data.length <= MAX_IMAGE_CHARS ? [block] : [],
-        );
-        const dropped = blocks.filter((block) => block.type === "image").length - images.length;
+        const texts = blocks.flatMap((block) => (block.type === "text" ? [block.text] : []));
+        const images: (typeof blocks)[number][] = [];
+
+        let size = 0;
+
+        let dropped = 0;
+
+        for (const block of blocks) {
+            if (block.type !== "image") {
+                continue;
+            }
+
+            const fits =
+                images.length < MAX_IMAGES &&
+                size + block.data.length <= MAX_IMAGE_CHARS &&
+                IMAGE_TYPES.has(block.mimeType) &&
+                BASE64.test(block.data);
+
+            if (fits) {
+                size += block.data.length;
+                images.push(block);
+            } else {
+                dropped++;
+            }
+        }
+
         const head = `${called.isError === true ? "An error from" : "The result of"} the MCP tool ${quote(tool)} on the server ${quote(server.name)}. ${NOTE}`;
-        const body = cut(text.join("\n\n"), MAX_RESULT_CHARS);
-        const tail = dropped > 0 ? `\n(${dropped} large image(s) left out.)` : "";
+        const body = cut(texts.join("\n\n"), MAX_RESULT_CHARS);
+        const tail =
+            dropped > 0
+                ? `\n(${dropped} image(s) left out: too many, too large, or not PNG, JPEG, GIF, or WebP.)`
+                : "";
 
         return {
             content: [
@@ -398,6 +534,10 @@ export default function createMcp(host: Host, web: Web) {
 
     /** Why a call failed, without what could hold a secret: no HTTP bodies, no error output, no settings. */
     const failure = (server: Server, tool: string, error: unknown): Error => {
+        if (server.status === "needs-sign-in") {
+            return new Error(notConnected(server));
+        }
+
         if (error instanceof McpTimeoutError) {
             return new Error(
                 `The MCP tool ${quote(tool)} on ${quote(server.name)} did not answer in ${Math.round(error.timeoutMs / 1000)} s. It may still run.`,
@@ -422,10 +562,6 @@ export default function createMcp(host: Host, web: Web) {
             );
         }
 
-        if (server.status === "needs-sign-in") {
-            return new Error(notConnected(server));
-        }
-
         return new Error(
             `The call to MCP server ${quote(server.name)} failed. The owner can see the server's state on the MCP page.`,
         );
@@ -436,7 +572,11 @@ export default function createMcp(host: Host, web: Web) {
         signal: AbortSignal | undefined,
         readOnly: boolean,
     ) => {
-        const server = liveServer(args.server);
+        if (servers.closed) {
+            throw new Error("The MCP extension was reloaded. Call the tool again.");
+        }
+
+        const server = serverFor(args.server);
 
         try {
             await server.client();
@@ -453,8 +593,13 @@ export default function createMcp(host: Host, web: Web) {
         }
 
         if (readOnly && !servers.planAllowed(server, tool)) {
+            const why =
+                tool.annotations?.readOnlyHint === true
+                    ? `The owner has not let plan mode run the read-only tools of ${quote(server.name)} (on the MCP page).`
+                    : `${quote(server.name)} does not mark ${quote(tool.name)} read-only.`;
+
             throw new Error(
-                `mcp_call_read_only runs only tools that the server marks read-only, on servers where the owner allows this on the MCP page. ${quote(tool.name)} is not one. Outside plan mode, use mcp_call.`,
+                `mcp_call_read_only runs only tools that mcp_tools marks [read-only]. ${why} Outside plan mode, use mcp_call.`,
             );
         }
 
@@ -462,15 +607,17 @@ export default function createMcp(host: Host, web: Web) {
             return result(
                 server,
                 tool.name,
-                await server.callTool(
-                    tool.name,
-                    (args.arguments ?? {}) as Record<string, unknown>,
-                    signal,
+                await servers.track(
+                    server.callTool(
+                        tool.name,
+                        (args.arguments ?? {}) as Record<string, unknown>,
+                        signal,
+                    ),
                 ),
             );
         } catch (error) {
             if (error instanceof McpAbortError || signal?.aborted) {
-                throw error;
+                throw new Error("The call was stopped.");
             }
 
             throw failure(server, tool.name, error);
@@ -491,7 +638,7 @@ export default function createMcp(host: Host, web: Web) {
         ),
     });
 
-    const list = Object.assign(
+    const mcpTools = Object.assign(
         defineTool({
             name: "mcp_tools",
             description:
@@ -507,7 +654,7 @@ export default function createMcp(host: Host, web: Web) {
                 const targets =
                     args.server === undefined
                         ? [...servers.live.values()]
-                        : [liveServer(args.server)];
+                        : [serverFor(args.server)];
 
                 if (targets.length === 0) {
                     return {
@@ -538,7 +685,7 @@ export default function createMcp(host: Host, web: Web) {
                     const visible = servers.visible(server);
                     const matches = visible.filter((tool) => {
                         const haystack =
-                            `${tool.name} ${tool.title ?? ""} ${tool.description ?? ""}`.toLowerCase();
+                            `${tool.name} ${titleOf(tool) ?? ""} ${text(tool.description) ?? ""}`.toLowerCase();
 
                         return words.every((word) => haystack.includes(word));
                     });
@@ -548,8 +695,9 @@ export default function createMcp(host: Host, web: Web) {
                     );
 
                     for (const tool of matches) {
-                        const title = tool.title ?? tool.annotations?.title;
-                        const about = [title, tool.description].filter(Boolean).join(" — ");
+                        const about = [titleOf(tool), text(tool.description)]
+                            .filter(Boolean)
+                            .join(" — ");
                         const schema = cut(
                             JSON.stringify(tool.inputSchema ?? {}),
                             MAX_SCHEMA_CHARS,
@@ -586,7 +734,7 @@ export default function createMcp(host: Host, web: Web) {
         { annotations: { readOnlyHint: true } },
     );
 
-    const callTool = defineTool({
+    const mcpCall = defineTool({
         name: "mcp_call",
         description:
             "Call a tool of an MCP server that the owner connected. First get the server's name, the tool's exact name, and its arguments from mcp_tools. An MCP server is a program that runs with the owner's rights: its tools can change files and data, and send data to other services.",
@@ -594,7 +742,7 @@ export default function createMcp(host: Host, web: Web) {
         execute: async (args, _api, context) => call(args, context.abortSignal, false),
     });
 
-    const callReadOnly = Object.assign(
+    const mcpCallReadOnly = Object.assign(
         defineTool({
             name: "mcp_call_read_only",
             description:
@@ -625,7 +773,13 @@ export default function createMcp(host: Host, web: Web) {
 
     web.route("POST", "servers/:name/on", async ({ params, body }) => {
         named(params.name!);
-        await servers.setOn(params.name!, body.on === true);
+
+        if (!(await servers.setOn(params.name!, body.on === true, body.fingerprint))) {
+            throw web.error(
+                409,
+                "The entry changed in mcp.json. Look at it again, then turn it on.",
+            );
+        }
 
         return servers.view();
     });
@@ -637,7 +791,8 @@ export default function createMcp(host: Host, web: Web) {
         return servers.view();
     });
 
-    const liveFor = (name: string): Server => {
+    /** The server of a route, when it is on. */
+    const serverOn = (name: string): Server => {
         named(name);
 
         const server = servers.live.get(name);
@@ -650,7 +805,7 @@ export default function createMcp(host: Host, web: Web) {
     };
 
     web.route("POST", "servers/:name/reconnect", async ({ params }) => {
-        await liveFor(params.name!)
+        await serverOn(params.name!)
             .reconnect()
             .catch(() => undefined);
 
@@ -658,13 +813,13 @@ export default function createMcp(host: Host, web: Web) {
     });
 
     web.route("POST", "servers/:name/sign-in", async ({ params }) => {
-        const signIn = await liveFor(params.name!).startSignIn();
+        const signIn = await serverOn(params.name!).startSignIn();
 
         return { url: signIn?.url ?? null };
     });
 
     web.route("POST", "servers/:name/sign-in/paste", async ({ params, body }) => {
-        const signIn = liveFor(params.name!).signIn;
+        const signIn = serverOn(params.name!).signIn;
 
         if (signIn === undefined) {
             throw web.error(409, "No sign-in waits for this server");
@@ -684,15 +839,13 @@ export default function createMcp(host: Host, web: Web) {
     });
 
     web.route("POST", "servers/:name/sign-in/cancel", ({ params }) => {
-        const server = liveFor(params.name!);
-
-        server.signIn?.cancel();
+        serverOn(params.name!).signIn?.cancel();
 
         return {};
     });
 
     web.route("POST", "servers/:name/sign-out", async ({ params }) => {
-        await liveFor(params.name!).signOut();
+        await serverOn(params.name!).signOut();
 
         return servers.view();
     });
@@ -701,7 +854,7 @@ export default function createMcp(host: Host, web: Web) {
 
     return defineExtension({
         name: "mcp",
-        tools: [list, callTool, callReadOnly],
+        tools: [mcpTools, mcpCall, mcpCallReadOnly],
         sections: [
             section("mcp", () => {
                 const on = servers.config.servers.filter((entry) => servers.live.has(entry.name));

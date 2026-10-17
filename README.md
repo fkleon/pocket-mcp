@@ -9,7 +9,7 @@ Pi's terminal app has MCP built in. Pi Pocket runs on Pi Durable, and does not h
 
 ## What it adds
 
-- **The MCP page** (for the owner only): the plug button on the rail, or **MCP servers** in the launcher. It shows each server of `mcp.json`, its state, its error output, and its tools. On this page you can:
+- **The MCP page** (for the owner only): the plug button on the rail, or **MCP servers** in the launcher. It shows each server of `mcp.json`, its entry, its state, its error output, and its tools. On this page you can:
     - turn a server on or off in Pi Pocket,
     - connect a server again,
     - sign in to an HTTP server, or sign out,
@@ -33,14 +33,17 @@ You need a Pi Pocket release after 0.14.0. From that release, drop-ins can impor
 The extension reads `~/.pi/agent/mcp.json`: the user file of Pi's terminal app. Use the same format, or add a server with Pi's commands in a terminal:
 
 ```bash
-pi mcp add notes -- npx -y @modelcontextprotocol/server-memory
+pi mcp add notes -- npx -y @modelcontextprotocol/server-memory@2026.8.31
 pi mcp add docs --url https://example.com/mcp
 ```
 
 ```json
 {
     "mcpServers": {
-        "notes": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"] },
+        "notes": {
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-memory@2026.8.31"]
+        },
         "docs": {
             "url": "https://example.com/mcp",
             "description": "Search the product documentation"
@@ -53,11 +56,20 @@ Pi's [MCP documentation](https://github.com/earendil-works/pi/blob/main/packages
 
 ### Turn a server on
 
-A new server is off in Pi Pocket. Turn it on with its switch on the MCP page. Pi Pocket then starts it, and Pi can use its tools.
+A new server is off in Pi Pocket. Examine its entry on the MCP page, then turn it on with its switch. Pi Pocket then starts it, and Pi can use its tools.
 
-The switch keeps a fingerprint (a SHA-256 hash) of the server's entry. When the entry changes, Pi Pocket stops the server and shows **Changed**. Examine the entry, then turn the server on again. Thus a change to `mcp.json` that you did not make (for example, from Pi with a shell command) does not start a program.
+The page shows each part of the entry: the command and its arguments, or the address, and `cwd`, `env`, `headers`, `oauth`, and the other fields. A value of `env`, `headers`, or `oauth.clientSecret` that names a variable (`${GITHUB_TOKEN}`) or runs a command (`!gh auth token`) shows as it is. A literal value shows only its length.
+
+The switch keeps a fingerprint (a SHA-256 hash) of the entry that the page showed. When the entry changes, Pi Pocket stops the server at its next read of `mcp.json`: when it starts, when you tap **Read mcp.json again**, and when you use a switch. The page then shows **Changed**, and which parts changed. Examine them, then turn the server on again. Plan mode's switch for the server goes off too.
 
 `"enabled": false` in `mcp.json` turns a server off in the terminal app and in Pi Pocket.
+
+#### What the switch does not stop
+
+The switch stops a changed entry that you did not see. For example, Pi can change `mcp.json` with the `edit` tool after you allow it in a hurry. But the switch cannot stop a program that runs as your user, such as a shell command of Pi. Such a program can also change the module's own settings, the scripts that a server runs, or a package that `npx` downloads. Lancet Guard judges Pi's shell commands and writes; it does not judge MCP calls. So:
+
+- Give exact package versions (`@2026.8.31`, not `@latest` or no version).
+- Run servers from folders that Pi does not work in.
 
 ### How Pi Pocket runs servers
 
@@ -67,6 +79,7 @@ The switch keeps a fingerprint (a SHA-256 hash) of the server's entry. When the 
 - **Environment.** A stdio server gets the environment of Pi Pocket's server, and the `env` of its entry. Values in `env` and `headers` can name environment variables (`${GITHUB_TOKEN}`) or run a command (`"!gh auth token"`), as in the terminal app.
 - **Exposure.** Pi Pocket does not use `exposure` and `toolExposure`, except `hidden`: a hidden tool is not available to Pi. All other tools are available through `mcp_tools` and `mcp_call`.
 - **Only the user file.** Pi Pocket does not read the `.pi/mcp.json` of a project. A server serves all sessions, and Pi can write files in a project.
+- **Stopping.** When a server goes off, Pi Pocket closes its input, then stops its process group. A program that a server started in a group of its own can continue to run.
 
 ### Not supported (yet)
 
@@ -88,25 +101,27 @@ The reasons for this design:
 - **What the extension installs is known.** The gallery and Pi Pocket can check the names before the extension loads, and no MCP tool can take the name of another tool.
 - **The terminal app works the same way by default.** Its `codemode` exposure does not declare MCP tools to the model either. Pi finds them by search.
 
-In codemode scripts, Pi can call `tools.mcp_call(…)` too.
+In codemode scripts, Pi can call `tools.mcp_call(…)` too. Each call of a script goes through the same checks.
 
 ### Results
 
-The result of an MCP tool goes to Pi between `<mcp_result>` tags, with a note that it is data, not instructions. A closing tag in the result cannot close the fence. The text is cut to 40,000 characters. Images go to Pi as images.
+The result of an MCP tool goes to Pi between `<mcp_result>` tags, with a note that it is data, not instructions. A closing tag in the result cannot close the fence. The text is cut to 40,000 characters. Images go to Pi as images: at most 4, of at most 8 MB of base64 together, and only PNG, JPEG, GIF, and WebP.
 
-When a call fails, Pi gets a short reason. Pi does not get the server's error output, an HTTP body, or the values of `env` and `headers`. The MCP page shows the full error to the owner.
+When a call fails, Pi gets a short reason. An error message from the server itself goes to Pi between `<mcp_error>` tags (at most 2,000 characters). Pi does not get the server's error output, an HTTP body, or the values of `env` and `headers`. The MCP page shows the full error to the owner.
 
 ### Plan mode
 
 Plan mode lets Pi run only tools that change nothing. A server can mark a tool read-only (`readOnlyHint`), but a server can be wrong, or not honest. So Pi Pocket does not trust this mark by default:
 
 - `mcp_call` never runs in plan mode.
-- `mcp_call_read_only` runs in plan mode. It runs only a tool that its server marks read-only, and only when you turned on **Plan mode may run the tools that this server marks read-only** for that server.
+- `mcp_call_read_only` runs in plan mode. It runs only a tool that its server marks read-only, and only when you turned on **Plan mode may run the tools that this server marks read-only** for that server. Turn it on only for a server that you trust to mark its tools correctly.
 - `mcp_tools` runs in plan mode. It only lists tools.
 
-### Restarts
+### Restarts and reloads
 
 A restart of Pi Pocket can stop a call while it runs. MCP calls are not safe to run two times, so Pi Pocket does not run the call again: Pi gets "interrupted". Only `mcp_tools` runs again, because it only lists tools.
+
+When the module loads again (after an edit, or when you turn it off), a call that runs finishes first. Then the module stops the servers of its old version.
 
 ## Sign in to an HTTP server
 
@@ -114,13 +129,13 @@ An HTTP server without an `Authorization` header in its entry can ask for an OAu
 
 1. Tap **Sign in**, then **Open the sign-in page**.
 2. Sign in, and approve the access.
-3. At the end, the page goes to an address on this machine (`http://127.0.0.1:…/callback`).
-    - When your browser is on the same machine as Pi Pocket, the sign-in is complete.
+3. At the end, the page goes to an address on the machine that runs Pi Pocket (`http://127.0.0.1:…/callback`, or the `oauth.callbackUrl` of the entry).
+    - When your browser is on the same machine, the sign-in is complete.
     - When your browser is on another device (for example, a phone), that page does not load. Copy its address from the address bar, paste it in the box on the MCP page, and tap **Finish**.
 
 Why not an address of Pi Pocket? Pi Pocket's routes for extensions accept only signed-in requests with the `X-Pocket` header. A redirect from the sign-in page cannot send this header. The terminal app uses the same loopback address.
 
-Pi Pocket keeps the tokens in `~/.pi-pocket/mcp/oauth.json`, which only your user can read. These are not the sign-ins of the terminal app (`~/.pi/agent/mcp-auth.json`): sign in one time in each app. **Sign out** removes the tokens.
+Pi Pocket keeps the tokens in `~/.pi-pocket/mcp/oauth.json`, which only your user can read. It refreshes them when they expire. These are not the sign-ins of the terminal app (`~/.pi/agent/mcp-auth.json`): sign in one time in each app. **Sign out** removes the tokens.
 
 The `oauth` fields of an entry work as in the terminal app: `clientId`, `clientSecret`, `callbackPort`, `callbackUrl`, `scope`, `clientName`, and `authServerMetadataUrl`.
 
@@ -128,14 +143,14 @@ The `oauth` fields of an entry work as in the terminal app: `clientId`, `clientS
 
 - **Reads** `~/.pi/agent/mcp.json`, the environment variables that its `env`, `headers`, and `oauth.clientSecret` values name, and the output of the commands that these values give (`!command`, run with your shell).
 - **Starts** the stdio servers that you turned on.
-- **Contacts** the HTTP servers that you turned on, and, for a sign-in, their authorization servers.
-- **Writes** `~/.pi-pocket/mcp/settings.json` (the servers that you turned on, and the plan-mode switches) and `~/.pi-pocket/mcp/oauth.json` (the sign-in tokens). Both are only for your user.
-- **Listens** on `127.0.0.1` during a sign-in, for the redirect.
+- **Contacts** the HTTP servers that you turned on. For a server that signs in with OAuth, it also contacts its authorization server: to sign in, and to refresh the tokens.
+- **Writes** `~/.pi-pocket/mcp/settings.json` (the servers that you turned on, with the hashes of their entries, and the plan-mode switches) and `~/.pi-pocket/mcp/oauth.json` (the sign-in tokens). Both are only for your user.
+- **Listens** on the loopback address of the redirect (`127.0.0.1` by default) while a sign-in waits, for at most 10 minutes.
 - It does not change `mcp.json`.
 
 ## Development
 
-The module is TypeScript that Node runs as it is. To check it, link the `node_modules` and the types of a Pi Pocket checkout:
+The module is TypeScript that Node runs as it is. The repository has no packages of its own: link the `node_modules` and the types of a Pi Pocket checkout, which have TypeScript, ESLint, and Prettier too.
 
 ```bash
 ln -s /path/to/pi-pocket/node_modules node_modules
@@ -146,7 +161,9 @@ npm run format       # eslint --fix, prettier
 PI_POCKET=/path/to/pi-pocket npm test
 ```
 
-The tests run a Pi Pocket with temporary data and a scripted model ([Testing](https://github.com/TannerMidd/pi-pocket/blob/main/docs/extensions/testing.md)). `test/fixtures/` has a small stdio server and a small HTTP server with OAuth, for tests by hand.
+Pi Pocket loads `mcp.ts` again when you save it, but not its helpers in `mcp/*.ts`: after a change to a helper, restart Pi Pocket. A change to `mcp/index.js` or `mcp/style.css` loads again in the open tabs.
+
+The tests run a Pi Pocket with temporary data and a scripted model ([Testing](https://github.com/TannerMidd/pi-pocket/blob/main/docs/extensions/testing.md)). `test/fixtures/` has a small stdio server, and a small HTTP server with OAuth (`node test/fixtures/http-server.mjs 8951 --oauth`), for tests by hand.
 
 ## License
 

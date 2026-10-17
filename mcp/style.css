@@ -123,9 +123,45 @@
     font: inherit;
 }
 
-.mcp-tools summary {
+.mcp-tools summary,
+.mcp-entry summary {
     cursor: pointer;
     color: var(--muted);
+}
+
+.mcp-entry p {
+    margin: 6px 0 0;
+}
+
+.mcp-entry dl {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 6px 0 0;
+}
+
+.mcp-entry dl > div {
+    display: flex;
+    flex-wrap: wrap;
+    column-gap: 8px;
+    min-width: 0;
+}
+
+.mcp-entry dt {
+    flex: none;
+    color: var(--muted);
+}
+
+.mcp-entry dd {
+    flex: 1 1 12rem;
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.mcp-entry .mcp-changed dt,
+.mcp-entry .mcp-changed dd {
+    color: var(--warn);
 }
 
 .mcp-tools ul {

@@ -3,7 +3,7 @@
  *
  * One connection serves all sessions. A stdio server runs in the folder that its entry gives (else the home folder),
  * gets Pi Pocket's environment with the entry's `env`, and gets no roots. A dropped connection opens again at the next
- * call. Closing a stdio server closes its input, then stops its whole process group (Pi's MCP client does this).
+ * call. Closing a stdio server closes its input, then stops its process group (Pi's MCP client does this).
  */
 import {
     type CallToolResult,
@@ -67,16 +67,15 @@ function passing(error: unknown): boolean {
 
 const sleep = (ms: number, signal: AbortSignal) =>
     new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, ms);
+        const done = () => {
+            clearTimeout(timer);
+            signal.removeEventListener("abort", done);
+            resolve();
+        };
 
-        signal.addEventListener(
-            "abort",
-            () => {
-                clearTimeout(timer);
-                resolve();
-            },
-            { once: true },
-        );
+        const timer = setTimeout(done, ms);
+
+        signal.addEventListener("abort", done, { once: true });
     });
 
 export class Server {
@@ -95,6 +94,9 @@ export class Server {
     #challenge: OAuthChallenge | undefined;
     #client: McpClient | undefined;
     #opening: Promise<McpClient> | undefined;
+    /** Clients left behind when the server forgot their session: closed with the server. */
+    readonly #detached = new Set<McpClient>();
+    #starting: Promise<SignIn | undefined> | undefined;
     /** The error output of the last stdio server that failed to connect. */
     #stderr: string | undefined;
 
@@ -153,10 +155,6 @@ export class Server {
         return (await serverState(this.#oauth, this.name, http.url).load())?.tokens !== undefined;
     }
 
-    #changed(): void {
-        this.#onChange();
-    }
-
     /** The connected client: the open one, or a new connection. */
     client(): Promise<McpClient> {
         if (this.closed) {
@@ -176,12 +174,23 @@ export class Server {
 
     /** Wait at most `ms` for a connection; the connection goes on after that. */
     async ready(ms: number): Promise<void> {
+        let timer: NodeJS.Timeout | undefined;
+
         const connecting = this.client().then(
             () => undefined,
             () => undefined,
         );
 
-        await Promise.race([connecting, new Promise((resolve) => setTimeout(resolve, ms).unref())]);
+        try {
+            await Promise.race([
+                connecting,
+                new Promise((resolve) => {
+                    timer = setTimeout(resolve, ms);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     /**
@@ -205,8 +214,10 @@ export class Server {
                 });
             } catch (error) {
                 if (error instanceof McpSessionExpiredError && attempt === 1) {
+                    // Not closed now: that would fail its other calls, which get the same answer and try again.
                     if (this.#client === client) {
                         this.#client = undefined;
+                        this.#detached.add(client);
                     }
 
                     continue;
@@ -233,8 +244,19 @@ export class Server {
         await this.client();
     }
 
-    /** Start a sign-in, or finish one at once with the stored refresh token. */
-    async startSignIn(): Promise<SignIn | undefined> {
+    /**
+     * Start a sign-in, or finish one at once with the stored refresh token. A second tap while one starts gets the same
+     * sign-in; a new sign-in cancels the one before.
+     */
+    startSignIn(): Promise<SignIn | undefined> {
+        this.#starting ??= this.#startSignIn().finally(() => {
+            this.#starting = undefined;
+        });
+
+        return this.#starting;
+    }
+
+    async #startSignIn(): Promise<SignIn | undefined> {
         const http = this.#http;
 
         if (!http || !this.oauth) {
@@ -251,6 +273,12 @@ export class Server {
             ...(this.#challenge === undefined ? {} : { challenge: this.#challenge }),
         });
 
+        if (this.closed) {
+            signIn?.cancel();
+
+            throw new Error(`MCP server "${this.name}" is shut down`);
+        }
+
         if (signIn === undefined) {
             await this.reconnect().catch(() => undefined);
 
@@ -258,7 +286,7 @@ export class Server {
         }
 
         this.signIn = signIn;
-        this.#changed();
+        this.#onChange();
         signIn.done.then(
             () => {
                 if (this.signIn === signIn) {
@@ -268,11 +296,17 @@ export class Server {
                 void this.reconnect().catch(() => undefined);
             },
             (error: unknown) => {
-                if (this.signIn === signIn) {
-                    this.signIn = undefined;
-                    this.error = `Sign-in failed: ${message(error)}`;
-                    this.#changed();
+                if (this.signIn !== signIn) {
+                    return;
                 }
+
+                this.signIn = undefined;
+
+                if (!signIn.cancelled) {
+                    this.error = `Sign-in failed: ${message(error)}`;
+                }
+
+                this.#onChange();
             },
         );
 
@@ -309,11 +343,12 @@ export class Server {
         this.signIn = undefined;
         this.status = "closed";
 
-        const client = this.#client;
+        const clients = [this.#client, ...this.#detached];
 
         this.#client = undefined;
+        this.#detached.clear();
         await Promise.all([
-            client?.close().catch(() => undefined),
+            ...clients.map((client) => client?.close().catch(() => undefined)),
             this.#opening?.catch(() => undefined),
         ]);
         // A refresh that the server answered may have changed the refresh token: keep it.
@@ -330,7 +365,7 @@ export class Server {
     #markNeedsSignIn(): void {
         this.status = "needs-sign-in";
         this.error = undefined;
-        this.#changed();
+        this.#onChange();
     }
 
     async #drop(client: McpClient): Promise<void> {
@@ -343,7 +378,7 @@ export class Server {
 
     async #open(): Promise<McpClient> {
         this.status = "connecting";
-        this.#changed();
+        this.#onChange();
 
         const retries = this.#http ? RETRY_DELAYS_MS : [];
 
@@ -439,7 +474,9 @@ export class Server {
             this.tools = tools;
             this.status = "connected";
             this.error = undefined;
-            this.#changed();
+            // A later sign-in is a new one, not a request for more scope.
+            this.#challenge = undefined;
+            this.#onChange();
 
             return client;
         } catch (error) {
@@ -466,7 +503,7 @@ export class Server {
 
         this.status = this.closed ? "closed" : "failed";
         this.error = stderr ? `${message(error)}\n${stderr}` : message(error);
-        this.#changed();
+        this.#onChange();
 
         return new Error(`MCP server "${this.name}" failed to connect`);
     }
@@ -483,22 +520,27 @@ export class Server {
         const stderr = stdio?.stderr.trim().slice(-STDERR_TAIL);
 
         this.error = stderr ? `The connection closed.\n${stderr}` : "The connection closed.";
-        this.#changed();
+        this.#onChange();
     }
 
     async #refreshTools(client: McpClient): Promise<void> {
+        let tools: Tool[];
+
         try {
-            const tools = await client.listTools();
-
-            if (this.#client !== client || this.closed) {
-                return;
-            }
-
-            this.tools = tools;
+            tools = await client.listTools();
         } catch (error) {
-            this.error = `Could not list the tools again: ${message(error)}`;
+            tools = this.tools;
+
+            if (this.#client === client) {
+                this.error = `Could not list the tools again: ${message(error)}`;
+            }
         }
 
-        this.#changed();
+        if (this.#client !== client || this.closed) {
+            return;
+        }
+
+        this.tools = tools;
+        this.#onChange();
     }
 }

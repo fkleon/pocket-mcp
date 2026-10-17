@@ -24,6 +24,8 @@ import {
     OAuthCallbackServer,
     type OAuthChallenge,
     type OAuthClientInformationMixed,
+    type OAuthClientProvider,
+    OAuthError,
     parseWwwAuthenticate,
     stepUpScope,
 } from "@earendil-works/pi-mcp/oauth";
@@ -39,7 +41,7 @@ const REQUEST_TIMEOUT_MS = 15_000;
 const REFRESH_SKEW_MS = 30_000;
 
 /** How long a sign-in waits for the browser, or for the owner to paste the address. */
-export const SIGN_IN_TIMEOUT_MS = 10 * 60_000;
+const SIGN_IN_TIMEOUT_MS = 10 * 60_000;
 
 export type OAuthStates = Record<string, McpOAuthState>;
 
@@ -185,6 +187,33 @@ function provider(
 }
 
 /**
+ * A provider that can only refresh: when the refresh fails, the flow cannot register a client, keep a new code
+ * verifier, or start a sign-in, so a sign-in that the owner has open stays as it is.
+ */
+function refreshOnly(real: McpOAuthProvider): OAuthClientProvider {
+    return {
+        redirectUrl: real.redirectUrl,
+        clientMetadata: real.clientMetadata,
+        clientInformation: () => real.clientInformation(),
+        tokens: () => real.tokens(),
+        saveTokens: (tokens) => real.saveTokens(tokens),
+        discoveryState: () => real.discoveryState(),
+        saveDiscoveryState: (discovery) => real.saveDiscoveryState(discovery),
+        // Tokens that the server refused can go; the client and an open sign-in stay.
+        invalidateCredentials: async (kind) => {
+            if (kind === "tokens") {
+                await real.invalidateCredentials("tokens");
+            }
+        },
+        codeVerifier: () => real.codeVerifier(),
+        saveCodeVerifier: () => {},
+        redirectToAuthorization: () => {
+            throw new McpOAuthAuthorizationRequiredError();
+        },
+    };
+}
+
+/**
  * The auth provider of a connection: the stored access token, refreshed when it is about to end or after a 401. It
  * throws `McpOAuthAuthorizationRequiredError` when the owner must sign in, and never registers a client or opens a
  * sign-in by itself. Requests of this process share one refresh.
@@ -217,7 +246,7 @@ export function connectionAuth(options: {
                 registeredRedirects(state.clientInformation)[0] ??
                 FALLBACK_REDIRECT;
             const result = await authorizeMcp(
-                provider(serverUrl, store, settings, redirectUrl, () => {}),
+                refreshOnly(provider(serverUrl, store, settings, redirectUrl, () => {})),
                 {
                     serverUrl,
                     ...(challenge?.resourceMetadataUrl === undefined
@@ -234,9 +263,16 @@ export function connectionAuth(options: {
             if (result === "REDIRECT") {
                 throw new McpOAuthAuthorizationRequiredError();
             }
-        })().finally(() => {
-            refreshing = undefined;
-        });
+        })()
+            .catch((error: unknown) => {
+                // The authorization server refused the refresh (or the client): the owner must sign in again.
+                throw error instanceof OAuthError
+                    ? new McpOAuthAuthorizationRequiredError()
+                    : error;
+            })
+            .finally(() => {
+                refreshing = undefined;
+            });
 
         return refreshing;
     };
@@ -285,6 +321,8 @@ export interface SignIn {
     readonly url: string;
     /** Settles when the sign-in is complete, or fails, or is cancelled. */
     readonly done: Promise<void>;
+    /** The owner, or a newer sign-in, cancelled it. */
+    readonly cancelled: boolean;
     /** Finish with the address that the browser went to at the end, pasted by the owner. */
     paste(address: string): Promise<void>;
     cancel(): void;
@@ -448,6 +486,8 @@ export async function startSignIn(options: {
         const state = await oauth.state();
         const redirect = new URL(authorizationUrl.searchParams.get("redirect_uri") ?? redirectUrl);
 
+        let cancelled = false;
+
         let pasted: (response: { code: string; iss?: string }) => void = () => {};
 
         const fromOwner = new Promise<{ code: string; iss?: string }>((resolve, reject) => {
@@ -481,11 +521,17 @@ export async function startSignIn(options: {
         return {
             url: authorizationUrl.href,
             done,
+            get cancelled() {
+                return cancelled;
+            },
             paste: async (address) => {
                 pasted(fromAddress(address, state, redirect));
                 await done;
             },
-            cancel: () => stop.abort(),
+            cancel: () => {
+                cancelled = true;
+                stop.abort();
+            },
         };
     } catch (error) {
         stop.abort();
