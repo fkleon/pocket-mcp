@@ -46,12 +46,38 @@ const START_RETRY_MS = 3_000;
 const MAX_RESULT_CHARS = 40_000;
 const MAX_LIST_CHARS = 40_000;
 const MAX_SCHEMA_CHARS = 2_000;
-/** The images of one result that go to the model at most: their number, and their base64 characters together. */
+/** How long a version waits for its calls before it stops its servers anyway. */
+const CLOSE_WAIT_MS = 10_000;
+/**
+ * The images of one result that go to the model at most: their number, the base64 characters of each (under the 5 MB
+ * that providers take), and of all together. An image that a provider refuses would fail each later request.
+ */
 const MAX_IMAGES = 4;
-const MAX_IMAGE_CHARS = 8_000_000;
-/** Image types that every model provider takes. */
-const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const MAX_IMAGE_CHARS = 3_700_000;
+const MAX_IMAGES_CHARS = 8_000_000;
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+/** The image types that every provider takes, each with the first bytes of its files. */
+const IMAGE_TYPES: Record<string, (head: Buffer) => boolean> = {
+    "image/png": (head) => head.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47])),
+    "image/jpeg": (head) => head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff,
+    "image/gif": (head) => head.subarray(0, 4).toString("latin1") === "GIF8",
+    "image/webp": (head) =>
+        head.subarray(0, 4).toString("latin1") === "RIFF" &&
+        head.subarray(8, 12).toString("latin1") === "WEBP",
+};
+
+/** Whether an image is one that every provider takes: base64 of its type, and not too large. */
+function goodImage(data: string, mimeType: string): boolean {
+    const magic = Object.hasOwn(IMAGE_TYPES, mimeType) ? IMAGE_TYPES[mimeType] : undefined;
+
+    return (
+        magic !== undefined &&
+        data.length <= MAX_IMAGE_CHARS &&
+        BASE64.test(data) &&
+        magic(Buffer.from(data.slice(0, 16), "base64"))
+    );
+}
+
 /** Tool names that Pi gets to see: what the MCP specification asks of a name. Other tools are left out. */
 const TOOL_NAME = /^[A-Za-z0-9_.:/-]{1,128}$/;
 
@@ -256,16 +282,14 @@ class Servers {
 
         await this.#settings.update((settings) => {
             const current = serverSettings(settings, name);
-            const kept =
-                current.planMode === true &&
-                (current.approved === undefined || current.approved === entry.fingerprint);
+            // Off forgets the server, plan mode's trust too.
             const next: ServerSettings = on
                 ? {
                       approved: entry.fingerprint,
                       parts: Object.fromEntries(entry.parts.map((part) => [part.key, part.hash])),
-                      planMode: kept,
+                      planMode: current.approved === entry.fingerprint && current.planMode === true,
                   }
-                : { planMode: current.planMode === true };
+                : {};
 
             settings.servers = { ...settings.servers, [name]: next };
         });
@@ -274,14 +298,25 @@ class Servers {
         return true;
     }
 
-    async setPlanMode(name: string, on: boolean): Promise<void> {
+    /** Let plan mode trust the read-only marks of a server that is on, for its entry as it is. False when it is not on. */
+    async setPlanMode(name: string, on: boolean): Promise<boolean> {
+        const entry = this.entry(name);
+
+        if (entry === undefined || !this.live.has(name)) {
+            return false;
+        }
+
         await this.#settings.update((settings) => {
+            const current = serverSettings(settings, name);
+
             settings.servers = {
                 ...settings.servers,
-                [name]: { ...serverSettings(settings, name), planMode: on },
+                [name]: { ...current, planMode: on && current.approved === entry.fingerprint },
             };
         });
         await this.load();
+
+        return true;
     }
 
     /** Whether plan mode may run the tool: the server marks it read-only, and the owner trusts that here. */
@@ -370,7 +405,7 @@ class Servers {
             status: server?.status ?? "off",
             ...(server?.error === undefined ? {} : { error: server.error }),
             // A changed entry loses plan mode's trust when the owner turns it on again.
-            planMode: settings.planMode === true && pocket !== "changed",
+            planMode: settings.planMode === true && pocket === "on",
             oauth: server?.oauth ?? false,
             signedIn: (await server?.signedIn()) ?? false,
             ...(server?.signIn === undefined ? {} : { signIn: server.signIn.url }),
@@ -435,7 +470,10 @@ class Servers {
     async close(): Promise<void> {
         this.#closed = true;
         clearTimeout(this.#notify);
-        await Promise.allSettled([...this.#calls]);
+        await Promise.race([
+            Promise.allSettled([...this.#calls]),
+            new Promise((resolve) => setTimeout(resolve, CLOSE_WAIT_MS).unref()),
+        ]);
 
         const servers = [...this.live.values()];
 
@@ -453,11 +491,12 @@ export default function createMcp(host: Host, web: Web) {
     // Connect after the module has loaded, not while it loads. A version that does not install is cleaned up first.
     const start = setTimeout(() => {
         if (!servers.closed) {
+            // The owner's page shows why, not a notice: a notice goes to more people.
             servers.load().catch((error: unknown) => {
-                host.notice(
-                    "error",
-                    `MCP: could not read the servers: ${(error as Error).message}`,
+                servers.config.errors.push(
+                    `The servers did not start: ${(error as Error).message}`,
                 );
+                servers.changed();
             });
         }
     }, 0);
@@ -501,9 +540,8 @@ export default function createMcp(host: Host, web: Web) {
 
             const fits =
                 images.length < MAX_IMAGES &&
-                size + block.data.length <= MAX_IMAGE_CHARS &&
-                IMAGE_TYPES.has(block.mimeType) &&
-                BASE64.test(block.data);
+                size + block.data.length <= MAX_IMAGES_CHARS &&
+                goodImage(block.data, block.mimeType);
 
             if (fits) {
                 size += block.data.length;
@@ -786,7 +824,10 @@ export default function createMcp(host: Host, web: Web) {
 
     web.route("POST", "servers/:name/plan-mode", async ({ params, body }) => {
         named(params.name!);
-        await servers.setPlanMode(params.name!, body.on === true);
+
+        if (!(await servers.setPlanMode(params.name!, body.on === true))) {
+            throw web.error(409, "Turn the server on first");
+        }
 
         return servers.view();
     });

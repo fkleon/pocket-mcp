@@ -40,6 +40,8 @@ const REQUEST_TIMEOUT_MS = 15_000;
 /** Access tokens this close to their end are refreshed before they go out. */
 const REFRESH_SKEW_MS = 30_000;
 
+/** OAuth errors after which only a new sign-in helps. */
+const REFUSED = new Set(["invalid_grant", "invalid_client", "unauthorized_client"]);
 /** How long a sign-in waits for the browser, or for the owner to paste the address. */
 const SIGN_IN_TIMEOUT_MS = 10 * 60_000;
 
@@ -265,8 +267,9 @@ export function connectionAuth(options: {
             }
         })()
             .catch((error: unknown) => {
-                // The authorization server refused the refresh (or the client): the owner must sign in again.
-                throw error instanceof OAuthError
+                // The authorization server refused the refresh, or the client: the owner must sign in again. Other
+                // errors (a server that is down for a moment) stay as they are.
+                throw error instanceof OAuthError && REFUSED.has(error.code)
                     ? new McpOAuthAuthorizationRequiredError()
                     : error;
             })

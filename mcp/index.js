@@ -230,7 +230,7 @@ export default function setup(pocket) {
                 <${Switch}
                     on=${server.planMode}
                     label=${`Plan mode may run read-only tools of ${server.name}`}
-                    disabled=${busy}
+                    disabled=${busy || server.pocket !== "on"}
                     onChange=${() => run("plan-mode", { on: !server.planMode })}
                 />
             </div>

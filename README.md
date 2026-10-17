@@ -58,9 +58,14 @@ Pi's [MCP documentation](https://github.com/earendil-works/pi/blob/main/packages
 
 A new server is off in Pi Pocket. Examine its entry on the MCP page, then turn it on with its switch. Pi Pocket then starts it, and Pi can use its tools.
 
-The page shows each part of the entry: the command and its arguments, or the address, and `cwd`, `env`, `headers`, `oauth`, and the other fields. A value of `env`, `headers`, or `oauth.clientSecret` that names a variable (`${GITHUB_TOKEN}`) or runs a command (`!gh auth token`) shows as it is. A literal value shows only its length.
+The page shows each part of the entry: the command and its arguments, or the address, and `cwd`, `env`, `headers`, `oauth`, and the other fields. All values show in full, with these exceptions:
 
-The switch keeps a fingerprint (a SHA-256 hash) of the entry that the page showed. When the entry changes, Pi Pocket stops the server at its next read of `mcp.json`: when it starts, when you tap **Read mcp.json again**, and when you use a switch. The page then shows **Changed**, and which parts changed. Examine them, then turn the server on again. Plan mode's switch for the server goes off too.
+- A value of `env` or `headers` whose name looks secret (it has `TOKEN`, `KEY`, `SECRET`, `PASS`, `AUTH`, `COOKIE`, `CREDENTIAL`, `SESSION`, or `PRIVATE` in it), and `oauth.clientSecret`, show only their length and the variables that they name (`${GITHUB_TOKEN}`).
+- A command (`!gh auth token`) always shows in full.
+
+Values that change what a program runs, such as `NODE_OPTIONS` or `PATH`, show in full. The address shows in full too, with its query: keep tokens out of the address.
+
+The switch keeps a fingerprint (a SHA-256 hash) of the entry that the page showed. When the entry changes, Pi Pocket stops the server at its next read of `mcp.json`: when it starts, when you tap **Read mcp.json again**, and when you use a switch. The page then shows **Changed**, and which parts changed. Examine them, then turn the server on again.
 
 `"enabled": false` in `mcp.json` turns a server off in the terminal app and in Pi Pocket.
 
@@ -114,14 +119,14 @@ When a call fails, Pi gets a short reason. An error message from the server itse
 Plan mode lets Pi run only tools that change nothing. A server can mark a tool read-only (`readOnlyHint`), but a server can be wrong, or not honest. So Pi Pocket does not trust this mark by default:
 
 - `mcp_call` never runs in plan mode.
-- `mcp_call_read_only` runs in plan mode. It runs only a tool that its server marks read-only, and only when you turned on **Plan mode may run the tools that this server marks read-only** for that server. Turn it on only for a server that you trust to mark its tools correctly.
+- `mcp_call_read_only` runs in plan mode. It runs only a tool that its server marks read-only, and only when you turned on **Plan mode may run the tools that this server marks read-only** for that server. Turn it on only for a server that you trust to mark its tools correctly. The switch works only while the server is on. It goes off when you turn the server off, and when the entry of the server changes.
 - `mcp_tools` runs in plan mode. It only lists tools.
 
 ### Restarts and reloads
 
 A restart of Pi Pocket can stop a call while it runs. MCP calls are not safe to run two times, so Pi Pocket does not run the call again: Pi gets "interrupted". Only `mcp_tools` runs again, because it only lists tools.
 
-When the module loads again (after an edit, or when you turn it off), a call that runs finishes first. Then the module stops the servers of its old version.
+When the module loads again (after an edit, or when you turn it off), a call that runs can finish first, for 10 seconds at most. Then the module stops the servers of its old version, and a call that still runs fails.
 
 ## Sign in to an HTTP server
 

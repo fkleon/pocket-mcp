@@ -45,6 +45,8 @@ const DEFAULT_TIMEOUT_SECONDS = 60;
 const STDERR_TAIL = 2_000;
 /** Pauses before another try at an HTTP server that failed with a passing error. */
 const RETRY_DELAYS_MS = [250, 1_000];
+/** A client whose session the server forgot closes this soon at most. */
+const DETACHED_MS = 10 * 60_000;
 /** A stdio server that does not stop by itself: stop it this soon, within the server's 3 s for cleanups. */
 const CLOSE_TIMEOUT_MS = 1_500;
 
@@ -218,6 +220,14 @@ export class Server {
                     if (this.#client === client) {
                         this.#client = undefined;
                         this.#detached.add(client);
+                        // Its other calls have their answers by the time limit of a request: then it goes.
+                        setTimeout(
+                            () => {
+                                this.#detached.delete(client);
+                                void client.close().catch(() => undefined);
+                            },
+                            Math.min(this.timeoutMs, DETACHED_MS),
+                        ).unref();
                     }
 
                     continue;

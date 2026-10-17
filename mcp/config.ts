@@ -106,31 +106,40 @@ function canonical(value: unknown): string {
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
-export function fingerprintOf(raw: Record<string, unknown>): string {
+function fingerprintOf(raw: Record<string, unknown>): string {
     const { enabled: _enabled, ...rest } = raw;
 
     return sha256(canonical(rest));
 }
 
+/** Names of env variables and headers whose literal values the page does not show. */
+const SECRET_NAME = /token|key|secret|pass|auth|cookie|credential|session|private/i;
+const VARIABLE = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g;
+
 /**
- * A value that can hold a secret, as the page shows it: a command (`!…`) and a value that names variables (`${…}`)
- * show as they are, and a literal shows only its length.
+ * A value as the page shows it. A command (`!…`) shows as it is, and so does each value whose name does not look
+ * secret: such values (`NODE_OPTIONS`, `PATH`) change what runs. A secret shows only its length and the variables
+ * that it names.
  */
-function masked(value: unknown): string {
+function shown(value: unknown, secret: boolean): string {
     if (typeof value !== "string") {
         return canonical(value);
     }
 
-    return value.startsWith("!") || /\$\{?[A-Za-z_]/.test(value)
-        ? value
-        : `(a literal value of ${value.length} characters)`;
+    if (value.startsWith("!") || !secret) {
+        return value;
+    }
+
+    const names = [...value.matchAll(VARIABLE)].map((match) => `$${match[1] ?? match[2]}`);
+
+    return `(hidden: ${value.length} characters${names.length > 0 ? `, with ${names.join(", ")}` : ""})`;
 }
 
 /**
  * The parts of an entry that the fingerprint covers, one for each field, and one for each variable of `env`, header
  * of `headers`, and field of `oauth`. The owner's page shows them all, and which of them changed.
  */
-export function partsOf(raw: Record<string, unknown>): EntryPart[] {
+function partsOf(raw: Record<string, unknown>): EntryPart[] {
     const parts: EntryPart[] = [];
 
     for (const key of Object.keys(raw).sort()) {
@@ -142,11 +151,11 @@ export function partsOf(raw: Record<string, unknown>): EntryPart[] {
 
         if ((key === "env" || key === "headers" || key === "oauth") && isRecord(value)) {
             for (const name of Object.keys(value).sort()) {
-                const secret = key !== "oauth" || name === "clientSecret";
+                const secret = key === "oauth" ? name === "clientSecret" : SECRET_NAME.test(name);
 
                 parts.push({
                     key: `${key}.${name}`,
-                    text: secret ? masked(value[name]) : canonical(value[name]),
+                    text: shown(value[name], secret),
                     hash: sha256(canonical(value[name])),
                 });
             }
@@ -164,16 +173,19 @@ export function partsOf(raw: Record<string, unknown>): EntryPart[] {
     return parts;
 }
 
-/** The keys of the parts that are different from the hashes kept when the owner turned the server on. */
+/**
+ * The keys of the parts that are different from the hashes kept when the owner turned the server on. The entry did
+ * change (its fingerprint is another), so when no part shows it, as when a value moved to a key with the same name,
+ * all parts count as changed.
+ */
 export function changedParts(parts: EntryPart[], approved: Record<string, string>): string[] {
     const now = new Map(parts.map((part) => [part.key, part.hash]));
     const keys = new Set([...now.keys(), ...Object.keys(approved)]);
+    const changed = [...keys].filter(
+        (key) => now.get(key) !== (Object.hasOwn(approved, key) ? approved[key] : undefined),
+    );
 
-    return [...keys]
-        .filter(
-            (key) => now.get(key) !== (Object.hasOwn(approved, key) ? approved[key] : undefined),
-        )
-        .sort();
+    return (changed.length > 0 ? changed : [...now.keys()]).sort();
 }
 
 function exposureError(value: unknown): boolean {
@@ -248,7 +260,7 @@ function oauthError(value: unknown): string | undefined {
 }
 
 /** One entry of `mcpServers`, checked by the rules of Pi's own `mcp.json`. A string is what is wrong with it. */
-export function validateServer(name: string, raw: unknown): ServerConfig | string {
+function validateServer(name: string, raw: unknown): ServerConfig | string {
     if (!SERVER_NAME.test(name)) {
         return `invalid server name "${name}" (use letters, digits, "_" and "-")`;
     }
@@ -277,7 +289,10 @@ export function validateServer(name: string, raw: unknown): ServerConfig | strin
         return `server "${name}": description must be a string`;
     }
 
-    if (timeout !== undefined && (typeof timeout !== "number" || !(timeout > 0))) {
+    if (
+        timeout !== undefined &&
+        (typeof timeout !== "number" || !(timeout > 0) || !Number.isFinite(timeout))
+    ) {
         return `server "${name}": timeout must be a positive number of seconds`;
     }
 
@@ -498,10 +513,10 @@ export function toolExposure(config: ServerConfig, tool: string): Exposure {
     const overrides = config.toolExposure ?? {};
     const alias = (value: string) =>
         (value === "codemode-deferred" ? "codemode" : value) as Exposure;
-    const exact = overrides[tool];
 
-    if (exact !== undefined) {
-        return alias(exact);
+    // Own keys only: a tool named "constructor" must not find Object's.
+    if (Object.hasOwn(overrides, tool)) {
+        return alias(overrides[tool]!);
     }
 
     for (const [pattern, exposure] of Object.entries(overrides)) {
