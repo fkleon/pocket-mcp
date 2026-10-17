@@ -63,7 +63,7 @@ The page shows each part of the entry: the command and its arguments, or the add
 - A value of `env` or `headers` whose name looks secret (it has `TOKEN`, `KEY`, `SECRET`, `PASS`, `AUTH`, `COOKIE`, `CREDENTIAL`, `SESSION`, or `PRIVATE` in it), and `oauth.clientSecret`, show only their length and the variables that they name (`${GITHUB_TOKEN}`).
 - A command (`!gh auth token`) always shows in full.
 
-Values that change what a program runs, such as `NODE_OPTIONS` or `PATH`, show in full. The address shows in full too, with its query: keep tokens out of the address.
+Values that change what a program runs show in full, also when their names look secret: `NODE_OPTIONS`, `PATH`, `LD_PRELOAD`, `GIT_ASKPASS`, `BASH_ENV`, and similar names. The address shows in full too, with its query: keep tokens out of the address.
 
 The switch keeps a fingerprint (a SHA-256 hash) of the entry that the page showed. When the entry changes, Pi Pocket stops the server at its next read of `mcp.json`: when it starts, when you tap **Read mcp.json again**, and when you use a switch. The page then shows **Changed**, and which parts changed. Examine them, then turn the server on again.
 

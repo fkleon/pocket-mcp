@@ -209,8 +209,12 @@ function refreshOnly(real: McpOAuthProvider): OAuthClientProvider {
         },
         codeVerifier: () => real.codeVerifier(),
         saveCodeVerifier: () => {},
-        redirectToAuthorization: () => {
-            throw new McpOAuthAuthorizationRequiredError();
+        // The flow gets here also after a refresh that failed for a passing reason (a network error, a 5xx): the
+        // tokens are still there, and the next call tries again. Only tokens that are gone need a sign-in.
+        redirectToAuthorization: async () => {
+            throw (await real.tokens())?.refresh_token
+                ? new Error("the authorization server did not finish the refresh")
+                : new McpOAuthAuthorizationRequiredError();
         },
     };
 }

@@ -114,6 +114,9 @@ function fingerprintOf(raw: Record<string, unknown>): string {
 
 /** Names of env variables and headers whose literal values the page does not show. */
 const SECRET_NAME = /token|key|secret|pass|auth|cookie|credential|session|private/i;
+/** Names of variables that run programs or change what runs: their values always show. */
+const RUNS =
+    /askpass|_command$|_options$|^ld_|^dyld_|path$|_env$|_sock$|^(editor|visual|pager|shell|browser)$/i;
 const VARIABLE = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g;
 
 /**
@@ -151,7 +154,10 @@ function partsOf(raw: Record<string, unknown>): EntryPart[] {
 
         if ((key === "env" || key === "headers" || key === "oauth") && isRecord(value)) {
             for (const name of Object.keys(value).sort()) {
-                const secret = key === "oauth" ? name === "clientSecret" : SECRET_NAME.test(name);
+                const secret =
+                    key === "oauth"
+                        ? name === "clientSecret"
+                        : SECRET_NAME.test(name) && !RUNS.test(name);
 
                 parts.push({
                     key: `${key}.${name}`,
@@ -267,6 +273,13 @@ function validateServer(name: string, raw: unknown): ServerConfig | string {
 
     if (!isRecord(raw)) {
         return `server "${name}" must be an object`;
+    }
+
+    // A key with a "." would show on the page as a part of env, headers, or oauth.
+    const dotted = Object.keys(raw).find((key) => key.includes("."));
+
+    if (dotted !== undefined) {
+        return `server "${name}": the key "${dotted}" has a "."`;
     }
 
     const { type, exposure, enabled, timeout, toolExposure, description } = raw;

@@ -67,12 +67,18 @@ const IMAGE_TYPES: Record<string, (head: Buffer) => boolean> = {
 };
 
 /** Whether an image is one that every provider takes: base64 of its type, and not too large. */
-function goodImage(data: string, mimeType: string): boolean {
-    const magic = Object.hasOwn(IMAGE_TYPES, mimeType) ? IMAGE_TYPES[mimeType] : undefined;
+function goodImage(data: unknown, mimeType: unknown): boolean {
+    // The client passes both on as the server sent them: an array would pass for its text.
+    const magic =
+        typeof mimeType === "string" && Object.hasOwn(IMAGE_TYPES, mimeType)
+            ? IMAGE_TYPES[mimeType]
+            : undefined;
 
     return (
+        typeof data === "string" &&
         magic !== undefined &&
         data.length <= MAX_IMAGE_CHARS &&
+        data.length % 4 === 0 &&
         BASE64.test(data) &&
         magic(Buffer.from(data.slice(0, 16), "base64"))
     );
