@@ -15,13 +15,13 @@
     "files": [
         {
             "name": "mcp.ts",
-            "sha256": "1120a07b0a2b207029187c222604960e359837a3c181a44d24154e3f2d5c694d",
-            "size": 33887
+            "sha256": "1cfc85e6b08724b73ff1bc8c35f9eb3cf363b37ae93125deab398ce51fc6f0c9",
+            "size": 36254
         },
         {
             "name": "mcp/config.ts",
-            "sha256": "9ca63e9e0a6057e606e0213c868fff94c61424ecda8d96f48d1d589f9ee2957c",
-            "size": 20877
+            "sha256": "5a4bfead3a61e9a53a6fcc40bb5553c6b21ad4dc27c425e3aad1c2d8ae6b8b4e",
+            "size": 21902
         },
         {
             "name": "mcp/connection.ts",
@@ -30,8 +30,8 @@
         },
         {
             "name": "mcp/index.js",
-            "sha256": "1a5f280eaf49159205b054f0c5fbea70f75156768512801a6fa00ce8f40d291d",
-            "size": 15926
+            "sha256": "fd25705e41478ebee763e21ce81682d96b46790efdfec598435e98a915b9e264",
+            "size": 17223
         },
         {
             "name": "mcp/oauth.ts",
@@ -40,8 +40,8 @@
         },
         {
             "name": "mcp/style.css",
-            "sha256": "eb0a4be7862eecd704415da8cb1fa9c1347049bdddcea9ab7ff069a4f81d79d8",
-            "size": 3262
+            "sha256": "ce213d5775a825c5ee69be0fbfd8878c43794b5922a7b6a246c42a79682a5c34",
+            "size": 3620
         }
     ],
     "pocketApi": 1,
@@ -62,7 +62,8 @@
             "POST servers/:name/sign-in",
             "POST servers/:name/sign-in/paste",
             "POST servers/:name/sign-in/cancel",
-            "POST servers/:name/sign-out"
+            "POST servers/:name/sign-out",
+            "POST servers/:name/block"
         ],
         "client": "owner",
         "access": "owner"
