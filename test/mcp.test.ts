@@ -8,6 +8,7 @@ import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { pathToFileURL } from "node:url";
+import { matchesPattern, isValidPattern, isBlocked } from "../mcp/config.ts";
 
 const pocket = process.env.PI_POCKET ?? join(import.meta.dirname, "..", "..", "pi-pocket");
 const from = (path: string) => import(pathToFileURL(join(pocket, path)).href);
@@ -219,4 +220,183 @@ test("turning the module off stops the server's process", async () => {
     assert.equal(alive(), true);
     await app.setExtensionEnabled(owner(app), "mcp.ts", false);
     await until(() => !alive(), "the server's process ended", 5_000);
+});
+
+// ── Unit tests for tool-filter helpers ──────────────────────────────────
+
+test("matchesPattern matches exact names", () => {
+    assert.equal(matchesPattern("add_note", "add_note"), true);
+    assert.equal(matchesPattern("add_note", "list_notes"), false);
+});
+
+test("matchesPattern matches wildcards", () => {
+    assert.equal(matchesPattern("*webFetch*", "mcp__radius__tools_webFetch_run"), true);
+    assert.equal(matchesPattern("*webFetch*", "other_tool"), false);
+    assert.equal(matchesPattern("tools_*_run", "tools_webFetch_run"), true);
+    assert.equal(matchesPattern("tools_*_run", "tools_other_run"), true);
+    assert.equal(matchesPattern("tools_*_run", "other"), false);
+    assert.equal(matchesPattern("*", "any_tool_name"), true);
+    assert.equal(matchesPattern("mcp__*", "mcp__radius__add_note"), true);
+});
+
+test("matchesPattern handles special regex characters", () => {
+    assert.equal(matchesPattern("a.b", "a.b"), true);
+    assert.equal(matchesPattern("a.b", "axb"), false);
+    assert.equal(matchesPattern("a+b", "a+b"), true);
+    assert.equal(matchesPattern("a+b", "aab"), false);
+});
+
+test("isValidPattern validates allowed characters", () => {
+    assert.equal(isValidPattern("exact_name"), true);
+    assert.equal(isValidPattern("with-dash"), true);
+    assert.equal(isValidPattern("with.dot"), true);
+    assert.equal(isValidPattern("wild*card"), true);
+    assert.equal(isValidPattern("mixed_pattern-1.0*test"), true);
+    assert.equal(isValidPattern(""), false);
+    assert.equal(isValidPattern(123 as never), false);
+    assert.equal(isValidPattern(null as never), false);
+    assert.equal(isValidPattern({} as never), false);
+});
+
+test("isBlocked checks per-server blocked patterns", () => {
+    const settings = {
+        servers: {
+            radius: { approved: "abc", blocked: ["tools_webFetch*"] },
+            other: { approved: "def", blocked: [] },
+        },
+    };
+
+    assert.equal(isBlocked(settings, "radius", "tools_webFetch_run"), true);
+    assert.equal(isBlocked(settings, "radius", "tools_webFetch_url"), true);
+    assert.equal(isBlocked(settings, "radius", "other_tool"), false);
+    assert.equal(isBlocked(settings, "other", "tools_webFetch_run"), false);
+    assert.equal(isBlocked(settings, "nonexistent", "any_tool"), false);
+});
+
+test("isBlocked with no blocked array returns false", () => {
+    const settings: Parameters<typeof isBlocked>[0] = {
+        servers: { server: { approved: "x" } },
+    };
+
+    assert.equal(isBlocked(settings, "server", "any_tool"), false);
+});
+
+// ── Integration tests for tool-filter route ─────────────────────────────
+
+test("block route blocks a tool and excludes it from mcp_tools", async () => {
+    await until(async () => (await route("state")).servers.length === 1, "mcp.json read");
+    await turnOn("notes");
+
+    // Initially all tools are visible
+    const stateBefore = await shown("notes");
+    const allTools = stateBefore.tools;
+
+    assert.ok(allTools.length > 0, "server has tools");
+
+    // Block the first tool
+    const toolToBlock = allTools[0].name;
+
+    const response = await request(`servers/notes/block`, {
+        action: "block",
+        pattern: toolToBlock,
+    });
+
+    assert.equal(response.status, 200);
+
+    // Tool should still appear in state but marked as blocked
+    const stateAfter = await shown("notes");
+    const blockedTool = stateAfter.tools.find((t: { name: string }) => t.name === toolToBlock);
+
+    assert.ok(blockedTool?.blocked, "tool is marked as blocked in state");
+
+    // Blocked tools should not appear in mcp_tools output
+    const toolsList = await ask("mcp_tools", {});
+
+    assert.match(toolsList, /MCP tools/);
+    assert.doesNotMatch(
+        toolsList,
+        new RegExp(toolToBlock),
+        "blocked tool should not appear in mcp_tools output",
+    );
+
+    // Unclassified call to blocked tool should fail
+    const callResult = await mcpCall("notes", toolToBlock);
+
+    assert.match(callResult, /blocked/i);
+
+    // Unblock the tool
+    const unblockResponse = await request(`servers/notes/block`, {
+        action: "unblock",
+        pattern: toolToBlock,
+    });
+
+    assert.equal(unblockResponse.status, 200);
+
+    // Tool should no longer be blocked
+    const stateUnblocked = await shown("notes");
+    const unblockedTool = stateUnblocked.tools.find(
+        (t: { name: string }) => t.name === toolToBlock,
+    );
+
+    assert.ok(!unblockedTool?.blocked, "tool is no longer blocked after unblock");
+});
+
+test("block route rejects invalid patterns", async () => {
+    await until(async () => (await route("state")).servers.length === 1, "mcp.json read");
+
+    // Empty pattern
+    const emptyResponse = await request(`servers/notes/block`, {
+        action: "block",
+        pattern: "",
+    });
+
+    assert.equal(emptyResponse.status, 400);
+
+    // Invalid characters (spaces)
+    const spaceResponse = await request(`servers/notes/block`, {
+        action: "block",
+        pattern: "invalid pattern",
+    });
+
+    assert.equal(spaceResponse.status, 400);
+
+    // Invalid action
+    const actionResponse = await request(`servers/notes/block`, {
+        action: "delete",
+        pattern: "some_tool",
+    });
+
+    assert.equal(actionResponse.status, 400);
+});
+
+test("block route persists across reloads", async () => {
+    await until(async () => (await route("state")).servers.length === 1, "mcp.json read");
+    await turnOn("notes");
+
+    const stateBefore = await shown("notes");
+    const toolToBlock = stateBefore.tools[0].name;
+
+    // Block the tool
+    await request(`servers/notes/block`, {
+        action: "block",
+        pattern: toolToBlock,
+    });
+
+    // Reload the config
+    await route("reload", {});
+
+    // Tool should still be blocked after reload
+    const stateAfter = await shown("notes");
+    const blockedTool = stateAfter.tools.find((t: { name: string }) => t.name === toolToBlock);
+
+    assert.ok(blockedTool?.blocked, "tool remains blocked after reload");
+});
+
+test("block route handles non-existent server", async () => {
+    const response = await request(`servers/nonexistent/block`, {
+        action: "block",
+        pattern: "some_tool",
+    });
+
+    assert.equal(response.status, 404);
 });
