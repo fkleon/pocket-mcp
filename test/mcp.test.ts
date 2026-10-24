@@ -204,24 +204,6 @@ test("plan mode runs only the read-only tools of servers that the owner trusts",
     await app.commands.setPlan(session, owner(app), false);
 });
 
-test("turning the module off stops the server's process", async () => {
-    const pid = Number(readFileSync(pidFile, "utf8"));
-
-    const alive = () => {
-        try {
-            process.kill(pid, 0);
-
-            return true;
-        } catch {
-            return false;
-        }
-    };
-
-    assert.equal(alive(), true);
-    await app.setExtensionEnabled(owner(app), "mcp.ts", false);
-    await until(() => !alive(), "the server's process ended", 5_000);
-});
-
 // ── Unit tests for tool-filter helpers ──────────────────────────────────
 
 test("matchesPattern matches exact names", () => {
@@ -284,6 +266,8 @@ test("isBlocked with no blocked array returns false", () => {
 // ── Integration tests for tool-filter route ─────────────────────────────
 
 test("block route blocks a tool and excludes it from mcp_tools", async () => {
+    writeConfig({ notes: notes() });
+    await route("reload", {});
     await until(async () => (await route("state")).servers.length === 1, "mcp.json read");
     await turnOn("notes");
 
@@ -342,6 +326,8 @@ test("block route blocks a tool and excludes it from mcp_tools", async () => {
 });
 
 test("block route rejects invalid patterns", async () => {
+    writeConfig({ notes: notes() });
+    await route("reload", {});
     await until(async () => (await route("state")).servers.length === 1, "mcp.json read");
 
     // Empty pattern
@@ -370,6 +356,8 @@ test("block route rejects invalid patterns", async () => {
 });
 
 test("block route persists across reloads", async () => {
+    writeConfig({ notes: notes() });
+    await route("reload", {});
     await until(async () => (await route("state")).servers.length === 1, "mcp.json read");
     await turnOn("notes");
 
@@ -399,4 +387,22 @@ test("block route handles non-existent server", async () => {
     });
 
     assert.equal(response.status, 404);
+});
+
+test("turning the module off stops the server's process", async () => {
+    const pid = Number(readFileSync(pidFile, "utf8"));
+
+    const alive = () => {
+        try {
+            process.kill(pid, 0);
+
+            return true;
+        } catch {
+            return false;
+        }
+    };
+
+    assert.equal(alive(), true);
+    await app.setExtensionEnabled(owner(app), "mcp.ts", false);
+    await until(() => !alive(), "the server's process ended", 5_000);
 });

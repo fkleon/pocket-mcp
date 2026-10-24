@@ -765,7 +765,9 @@ export default function createMcp(host: Host, web: Web) {
                         continue;
                     }
 
-                    const visible = servers.visible(server);
+                    const visible = servers
+                        .visible(server)
+                        .filter((tool) => !servers.isBlocked(server, tool.name));
                     const matches = visible.filter((tool) => {
                         const haystack =
                             `${tool.name} ${titleOf(tool) ?? ""} ${text(tool.description) ?? ""}`.toLowerCase();
